@@ -1,238 +1,331 @@
-import argparse
-import logging
+# -*- coding: utf-8 -*-
+"""
+U-Net 训练脚本（零参数硬编码版，适配你的数据路径）
+- 数据目录（已硬编码）：
+    E:\Eelgrass_processed_images_2025\Alaska
+      ├─ image\     (RGB 主图)
+      ├─ index\     (mask，单通道，0..K-1 或 0/1)
+      ├─ glcm\      (可选，单通道，额外特征)
+      └─ splits\
+          ├─ train.txt
+          ├─ val.txt
+          └─ test.txt
+- 指标：Dice / mIoU / Acc / Prec / Rec / F1 / Boundary IoU / Boundary F1
+- 可视化：混淆矩阵 PNG、PR 曲线 PNG（每个 epoch）
+- 依赖：torch, torchvision, numpy, pillow, tqdm, matplotlib, scikit-learn, scipy
+"""
+
 import os
-import random
-import sys
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torchvision.transforms as transforms
-import torchvision.transforms.functional as TF
+import csv
+import logging
 from pathlib import Path
-from torch import optim
-from torch.utils.data import DataLoader, random_split
+from typing import Optional, List, Dict
+
+import numpy as np
+from PIL import Image
 from tqdm import tqdm
 
-import wandb
-from evaluate import evaluate
-from unet import UNet
-from utils.data_loading import BasicDataset, CarvanaDataset
-from utils.dice_score import dice_loss
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
 
-dir_img = Path('./data/imgs/')
-dir_mask = Path('./data/masks/')
-dir_checkpoint = Path('./checkpoints/')
+# 你的 UNet 在 unet/unet_mode.py 下
+from unet.unet_model import UNet
+
+# 独立评估模块（与本文件同目录）
+from evaluate import eval_on_loader, save_confusion_matrix_figure, save_pr_curves_figure
 
 
-def train_model(
-        model,
-        device,
-        epochs: int = 5,
-        batch_size: int = 1,
-        learning_rate: float = 1e-5,
-        val_percent: float = 0.1,
-        save_checkpoint: bool = True,
-        img_scale: float = 0.5,
-        amp: bool = False,
-        weight_decay: float = 1e-8,
-        momentum: float = 0.999,
-        gradient_clipping: float = 1.0,
-):
-    # 1. Create dataset
-    try:
-        dataset = CarvanaDataset(dir_img, dir_mask, img_scale)
-    except (AssertionError, RuntimeError, IndexError):
-        dataset = BasicDataset(dir_img, dir_mask, img_scale)
+# ==========================
+#         配置区
+# ==========================
+BASE_DIR = Path(r"E:\Eelgrass_processed_images_2025\Alaska")
+IMAGE_DIR = BASE_DIR / "image"
+INDEX_DIR = BASE_DIR / "index"   # mask
+GLCM_DIR  = BASE_DIR / "glcm"    # 可选
+SPLITS_DIR = BASE_DIR / "splits"
+OUT_DIR    = BASE_DIR / "checkpoints"
 
-    # 2. Split into train / validation partitions
-    n_val = int(len(dataset) * val_percent)
-    n_train = len(dataset) - n_val
-    train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(0))
+# 数据与模型设置
+CLASSES: int = 1                # 1=二分类；K>1=多分类
+BILINEAR: bool = False          # UNet 上采样：False=转置卷积；True=双线性
+SCALE: float = 1.0              # 下采样比例，例如 0.5
+EXTRA_MODE: Optional[str] = "append4"  # None | "append4" | "replace_red"
+INCLUDE_BACKGROUND: bool = False       # 多分类时，边界/PR 宏平均是否包含背景(0类)
 
-    # 3. Create data loaders
-    loader_args = dict(batch_size=batch_size, num_workers=os.cpu_count(), pin_memory=True)
-    train_loader = DataLoader(train_set, shuffle=True, **loader_args)
-    val_loader = DataLoader(val_set, shuffle=False, drop_last=True, **loader_args)
+# 训练超参
+EPOCHS: int = 20
+BATCH_SIZE: int = 2
+LR: float = 1e-4
+WEIGHT_DECAY: float = 1e-8
+MOMENTUM: float = 0.99
+GRAD_CLIP: float = 1.0
+WORKERS: int = 4
+AMP: bool = True                # 混合精度
 
-    # (Initialize logging)
-    experiment = wandb.init(project='U-Net', resume='allow', anonymous='must')
-    experiment.config.update(
-        dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
-             val_percent=val_percent, save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp)
+# 类不平衡（2选1）
+POS_WEIGHT: float = 0.0         # 二分类专用；>1 前景稀少时可增大
+CLASS_WEIGHTS: Optional[List[float]] = None  # 多分类专用，例如 [1.0, 2.0, 0.5]
+
+# PR 曲线
+PR_POINTS: int = 40             # 仅用于旧版 evaluate；现在用 sklearn 会自适应
+# ==========================
+
+
+# ==========================
+#       数据集定义
+# ==========================
+class SegDataset(Dataset):
+    """
+    - images_dir: RGB 主图目录（image/）
+    - masks_dir : 单通道 mask 目录（index/）
+    - split_list_file: 列表文件（每行一个基名，不带扩展名）
+    - dir_extra: 可选单通道目录（glcm/）
+    - extra_mode: None | 'append4' | 'replace_red'
+    """
+    def __init__(self,
+                 images_dir: Path,
+                 masks_dir: Path,
+                 split_list_file: Path,
+                 scale: float = 1.0,
+                 dir_extra: Optional[Path] = None,
+                 extra_mode: Optional[str] = None,
+                 valid_exts: Optional[List[str]] = None):
+        self.images_dir = Path(images_dir)
+        self.masks_dir = Path(masks_dir)
+        self.scale = scale
+        self.dir_extra = Path(dir_extra) if dir_extra else None
+        self.extra_mode = extra_mode
+        self.valid_exts = set(e.lower() for e in (valid_exts or [".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"]))
+
+        with open(split_list_file, "r", encoding="utf-8") as f:
+            self.ids = [line.strip() for line in f if line.strip()]
+        if not self.ids:
+            raise RuntimeError(f"Split list is empty: {split_list_file}")
+
+        # 扫描 mask 唯一值，映射到 0..K-1（保持与原始 BasicDataset 逻辑一致）
+        vals = []
+        for stem in self.ids:
+            mpath = self._find_first(self.masks_dir, stem)
+            m = np.asarray(Image.open(mpath).convert("L"))
+            vals.append(np.unique(m))
+        self.mask_values = sorted(np.unique(np.concatenate(vals)).tolist())
+
+    def __len__(self):
+        return len(self.ids)
+
+    def _find_first(self, folder: Path, stem: str) -> Path:
+        for ext in self.valid_exts:
+            p = folder / f"{stem}{ext}"
+            if p.exists():
+                return p
+        matches = list(folder.glob(f"{stem}.*"))
+        if not matches:
+            raise FileNotFoundError(f"File not found for {stem} in {folder}")
+        return matches[0]
+
+    @staticmethod
+    def _resize(img: Image.Image, scale: float, is_mask: bool):
+        if scale == 1.0:
+            return img
+        w, h = img.size
+        newW, newH = int(w * scale), int(h * scale)
+        assert newW > 0 and newH > 0
+        return img.resize((newW, newH), Image.NEAREST if is_mask else Image.BILINEAR)
+
+    def _pil_to_chw_float(self, pil_img: Image.Image) -> np.ndarray:
+        if pil_img.mode != "RGB":
+            pil_img = pil_img.convert("RGB")
+        arr = np.asarray(pil_img).transpose(2, 0, 1).astype(np.float32)
+        if (arr > 1).any():
+            arr /= 255.0
+        return arr
+
+    def _mask_to_long(self, pil_mask: Image.Image) -> np.ndarray:
+        m = np.asarray(pil_mask.convert("L"))
+        h, w = m.shape
+        out = np.zeros((h, w), dtype=np.int64)
+        for i, v in enumerate(self.mask_values):
+            out[m == v] = i
+        return out
+
+    def __getitem__(self, idx):
+        stem = self.ids[idx]
+        ip = self._find_first(self.images_dir, stem)
+        mp = self._find_first(self.masks_dir, stem)
+
+        img = Image.open(ip)
+        mask = Image.open(mp)
+
+        assert img.size == mask.size, f"Size mismatch for {stem}: {img.size} vs {mask.size}"
+
+        img = self._resize(img, self.scale, is_mask=False)
+        mask = self._resize(mask, self.scale, is_mask=True)
+
+        img_arr = self._pil_to_chw_float(img)
+
+        # glcm 作为单通道 extra
+        if self.dir_extra is not None and self.extra_mode is not None:
+            ep = self._find_first(self.dir_extra, stem)
+            extra = Image.open(ep)
+            if extra.mode != "L":
+                extra = extra.convert("L")
+            extra = self._resize(extra, self.scale, is_mask=False)
+            extra_arr = np.asarray(extra).astype(np.float32)
+            if (extra_arr > 1).any():
+                extra_arr /= 255.0
+            extra_arr = extra_arr[None, ...]
+            if self.extra_mode == "replace_red":
+                img_arr[0:1, ...] = extra_arr
+            elif self.extra_mode == "append4":
+                img_arr = np.concatenate([img_arr, extra_arr], axis=0)
+
+        mask_arr = self._mask_to_long(mask)
+        return {
+            "image": torch.from_numpy(img_arr.copy()).float().contiguous(),
+            "mask": torch.from_numpy(mask_arr.copy()).long().contiguous(),
+        }
+
+
+# ==========================
+#        训练主程序
+# ==========================
+def build_loaders():
+    dir_img = IMAGE_DIR
+    dir_mask = INDEX_DIR
+    dir_extra = GLCM_DIR if GLCM_DIR.exists() and EXTRA_MODE is not None else None
+    dir_splits = SPLITS_DIR
+
+    train_set = SegDataset(dir_img, dir_mask, dir_splits / "train.txt", scale=SCALE,
+                           dir_extra=dir_extra, extra_mode=EXTRA_MODE)
+    val_set   = SegDataset(dir_img, dir_mask, dir_splits / "val.txt",   scale=SCALE,
+                           dir_extra=dir_extra, extra_mode=EXTRA_MODE)
+    test_set  = SegDataset(dir_img, dir_mask, dir_splits / "test.txt",  scale=SCALE,
+                           dir_extra=dir_extra, extra_mode=EXTRA_MODE)
+
+    num_workers = min(WORKERS, os.cpu_count() or 0)
+    loader_args = dict(batch_size=BATCH_SIZE, num_workers=num_workers,
+                       pin_memory=True, persistent_workers=(num_workers > 0))
+    return (
+        DataLoader(train_set, shuffle=True,  **loader_args),
+        DataLoader(val_set,   shuffle=False, drop_last=True,  **loader_args),
+        DataLoader(test_set,  shuffle=False, drop_last=False, **loader_args),
     )
 
-    logging.info(f'''Starting training:
-        Epochs:          {epochs}
-        Batch size:      {batch_size}
-        Learning rate:   {learning_rate}
-        Training size:   {n_train}
-        Validation size: {n_val}
-        Checkpoints:     {save_checkpoint}
-        Device:          {device.type}
-        Images scaling:  {img_scale}
-        Mixed Precision: {amp}
-    ''')
 
-    # 4. Set up the optimizer, the loss, the learning rate scheduler and the loss scaling for AMP
-    optimizer = optim.RMSprop(model.parameters(),
-                              lr=learning_rate, weight_decay=weight_decay, momentum=momentum, foreach=True)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5)  # goal: maximize Dice score
-    grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
-    criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
-    global_step = 0
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logging.info(f"Using device: {device}")
 
-    # 5. Begin training
-    for epoch in range(1, epochs + 1):
+    # 构建数据
+    train_loader, val_loader, test_loader = build_loaders()
+
+    # 探测输入通道
+    in_ch = next(iter(train_loader))["image"].shape[1]
+    model = UNet(n_channels=in_ch, n_classes=CLASSES, bilinear=BILINEAR)
+    model = model.to(memory_format=torch.channels_last).to(device)
+
+    optimizer = torch.optim.RMSprop(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY,
+                                    momentum=MOMENTUM, foreach=True)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=5)
+    scaler = torch.cuda.amp.GradScaler(enabled=AMP)
+
+    # Loss
+    if CLASSES == 1:
+        pos_w = torch.tensor([POS_WEIGHT], dtype=torch.float32, device=device) if POS_WEIGHT > 0 else None
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_w)
+    else:
+        class_w = torch.tensor(CLASS_WEIGHTS, dtype=torch.float32, device=device) if CLASS_WEIGHTS else None
+        criterion = nn.CrossEntropyLoss(weight=class_w)
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    csv_path = OUT_DIR / "metrics_log.csv"
+    wrote_header = csv_path.exists()
+    best_val = -1.0
+
+    for epoch in range(1, EPOCHS + 1):
         model.train()
-        epoch_loss = 0
-        with tqdm(total=n_train, desc=f'Epoch {epoch}/{epochs}', unit='img') as pbar:
-            for batch in train_loader:
-                images, true_masks = batch['image'], batch['mask']
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}", unit="batch")
+        running_loss = 0.0
 
-                assert images.shape[1] == model.n_channels, \
-                    f'Network has been defined with {model.n_channels} input channels, ' \
-                    f'but loaded images have {images.shape[1]} channels. Please check that ' \
-                    'the images are loaded correctly.'
+        for batch in pbar:
+            images = batch["image"].to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
+            masks  = batch["mask"].to(device=device, dtype=torch.long)
 
-                images = images.to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
-                true_masks = true_masks.to(device=device, dtype=torch.long)
+            with torch.autocast(device.type if device.type != "mps" else "cpu", enabled=AMP):
+                logits = model(images)
+                if CLASSES == 1:
+                    loss = criterion(logits.squeeze(1), masks.float())
+                else:
+                    loss = criterion(logits, masks)
 
-                with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
-                    masks_pred = model(images)
-                    if model.n_classes == 1:
-                        loss = criterion(masks_pred.squeeze(1), true_masks.float())
-                        loss += dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks.float(), multiclass=False)
-                    else:
-                        loss = criterion(masks_pred, true_masks)
-                        loss += dice_loss(
-                            F.softmax(masks_pred, dim=1).float(),
-                            F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float(),
-                            multiclass=True
-                        )
+            optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            scaler.step(optimizer)
+            scaler.update()
+            running_loss += loss.item()
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-                optimizer.zero_grad(set_to_none=True)
-                grad_scaler.scale(loss).backward()
-                grad_scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
-                grad_scaler.step(optimizer)
-                grad_scaler.update()
+        train_loss_epoch = running_loss / max(1, len(train_loader))
 
-                pbar.update(images.shape[0])
-                global_step += 1
-                epoch_loss += loss.item()
-                experiment.log({
-                    'train loss': loss.item(),
-                    'step': global_step,
-                    'epoch': epoch
-                })
-                pbar.set_postfix(**{'loss (batch)': loss.item()})
+        # —— 验证（完整指标 + 图件）——
+        val_metrics, val_confmat, val_pr = eval_on_loader(
+            model, val_loader, device,
+            num_classes=CLASSES, amp=AMP,
+            pr_points=PR_POINTS, include_background=INCLUDE_BACKGROUND
+        )
 
-                # Evaluation round
-                division_step = (n_train // (5 * batch_size))
-                if division_step > 0:
-                    if global_step % division_step == 0:
-                        histograms = {}
-                        for tag, value in model.named_parameters():
-                            tag = tag.replace('/', '.')
-                            if not (torch.isinf(value) | torch.isnan(value)).any():
-                                histograms['Weights/' + tag] = wandb.Histogram(value.data.cpu())
-                            if not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
-                                histograms['Gradients/' + tag] = wandb.Histogram(value.grad.data.cpu())
+        scheduler.step(val_metrics["dice"])
+        logging.info(
+            ("[Val] Dice={dice:.4f} | mIoU={miou:.4f} | Acc={acc:.4f} | P={prec:.4f} | R={rec:.4f} | F1={f1:.4f} | "
+             "bIoU={b_iou:.4f} | bF1={b_f1:.4f} | LR={lr:.2e}")
+            .format(lr=optimizer.param_groups[0]['lr'], **val_metrics)
+        )
 
-                        val_score = evaluate(model, val_loader, device, amp)
-                        scheduler.step(val_score)
+        # 图件：混淆矩阵 & PR 曲线
+        save_confusion_matrix_figure(val_confmat, OUT_DIR / f"val_confmat_epoch{epoch}.png",
+                                     class_names=[str(i) for i in range(CLASSES)])
+        save_pr_curves_figure(val_pr, OUT_DIR / f"val_pr_epoch{epoch}.png")
 
-                        logging.info('Validation Dice score: {}'.format(val_score))
-                        try:
-                            experiment.log({
-                                'learning rate': optimizer.param_groups[0]['lr'],
-                                'validation Dice': val_score,
-                                'images': wandb.Image(images[0].cpu()),
-                                'masks': {
-                                    'true': wandb.Image(true_masks[0].float().cpu()),
-                                    'pred': wandb.Image(masks_pred.argmax(dim=1)[0].float().cpu()),
-                                },
-                                'step': global_step,
-                                'epoch': epoch,
-                                **histograms
-                            })
-                        except:
-                            pass
+        # 每轮写 CSV
+        with open(csv_path, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if not wrote_header:
+                w.writerow(["epoch","train_loss","val_dice","val_miou","val_acc","val_prec","val_rec","val_f1","val_bIoU","val_bF1"])
+                wrote_header = True
+            w.writerow([
+                epoch, f"{train_loss_epoch:.6f}",
+                f"{val_metrics['dice']:.6f}", f"{val_metrics['miou']:.6f}",
+                f"{val_metrics['acc']:.6f}",  f"{val_metrics['prec']:.6f}",
+                f"{val_metrics['rec']:.6f}",  f"{val_metrics['f1']:.6f}",
+                f"{val_metrics['b_iou']:.6f}", f"{val_metrics['b_f1']:.6f}",
+            ])
 
-        if save_checkpoint:
-            Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
-            state_dict = model.state_dict()
-            state_dict['mask_values'] = dataset.mask_values
-            torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
-            logging.info(f'Checkpoint {epoch} saved!')
+        # 保存
+        torch.save(model.state_dict(), OUT_DIR / f"checkpoint_epoch{epoch}.pth")
+        if val_metrics["dice"] > best_val:
+            best_val = val_metrics["dice"]
+            torch.save(model.state_dict(), OUT_DIR / "best.pth")
+            logging.info(f"✅ New best (Dice={best_val:.4f}) saved to {OUT_DIR / 'best.pth'}")
+
+    # —— Test 汇报一次（不必画图）——
+    test_metrics, _, _ = eval_on_loader(
+        model, test_loader, device,
+        num_classes=CLASSES, amp=AMP,
+        pr_points=PR_POINTS, include_background=INCLUDE_BACKGROUND
+    )
+    logging.info(
+        "[Test] Dice={dice:.4f} | mIoU={miou:.4f} | Acc={acc:.4f} | P={prec:.4f} | R={rec:.4f} | F1={f1:.4f} | bIoU={b_iou:.4f} | bF1={b_f1:.4f}"
+        .format(**test_metrics)
+    )
 
 
-def get_args():
-    parser = argparse.ArgumentParser(description='Train the UNet on images and target masks')
-    parser.add_argument('--epochs', '-e', metavar='E', type=int, default=5, help='Number of epochs')
-    parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=1, help='Batch size')
-    parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-5,
-                        help='Learning rate', dest='lr')
-    parser.add_argument('--load', '-f', type=str, default=False, help='Load model from a .pth file')
-    parser.add_argument('--scale', '-s', type=float, default=0.5, help='Downscaling factor of the images')
-    parser.add_argument('--validation', '-v', dest='val', type=float, default=10.0,
-                        help='Percent of the data that is used as validation (0-100)')
-    parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
-    parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
-    parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
-
-    return parser.parse_args()
-
-
-if __name__ == '__main__':
-    args = get_args()
-
-    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logging.info(f'Using device {device}')
-
-    # Change here to adapt to your data
-    # n_channels=3 for RGB images
-    # n_classes is the number of probabilities you want to get per pixel
-    model = UNet(n_channels=3, n_classes=args.classes, bilinear=args.bilinear)
-    model = model.to(memory_format=torch.channels_last)
-
-    logging.info(f'Network:\n'
-                 f'\t{model.n_channels} input channels\n'
-                 f'\t{model.n_classes} output channels (classes)\n'
-                 f'\t{"Bilinear" if model.bilinear else "Transposed conv"} upscaling')
-
-    if args.load:
-        state_dict = torch.load(args.load, map_location=device)
-        del state_dict['mask_values']
-        model.load_state_dict(state_dict)
-        logging.info(f'Model loaded from {args.load}')
-
-    model.to(device=device)
+if __name__ == "__main__":
     try:
-        train_model(
-            model=model,
-            epochs=args.epochs,
-            batch_size=args.batch_size,
-            learning_rate=args.lr,
-            device=device,
-            img_scale=args.scale,
-            val_percent=args.val / 100,
-            amp=args.amp
-        )
+        main()
     except torch.cuda.OutOfMemoryError:
-        logging.error('Detected OutOfMemoryError! '
-                      'Enabling checkpointing to reduce memory usage, but this slows down training. '
-                      'Consider enabling AMP (--amp) for fast and memory efficient training')
+        logging.error("OOM detected. Retrying after empty cache.")
         torch.cuda.empty_cache()
-        model.use_checkpointing()
-        train_model(
-            model=model,
-            epochs=args.epochs,
-            batch_size=args.batch_size,
-            learning_rate=args.lr,
-            device=device,
-            img_scale=args.scale,
-            val_percent=args.val / 100,
-            amp=args.amp
-        )
+        main()
