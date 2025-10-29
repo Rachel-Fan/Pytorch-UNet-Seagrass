@@ -1,218 +1,155 @@
 # -*- coding: utf-8 -*-
 """
-批量预测并保存：
-- class mask（按类别 id，uint8 PNG）
-- overlay（预测边界/区域叠加在原图上，便于质检）
-- （可选）probability map（仅二分类）
-
-模型：加载 checkpoints/best.pth
+predict.py — 读取 test.txt，生成同尺寸预测掩膜（0/1 PNG）及可选叠加图
+硬编码数据根目录：E:\Eelgrass_processed_images_2025\Alaska
+要求：best.pth 已在 checkpoints 目录
 依赖：torch, numpy, pillow, tqdm
 """
 
 import os
+os.environ["TORCHDYNAMO_DISABLE"] = "1"
+os.environ["TORCHINDUCTOR_DISABLED"] = "1"
+os.environ["TORCH_COMPILE_DISABLE"] = "1"
+
 from pathlib import Path
-from typing import Optional, List, Tuple
 import numpy as np
 from PIL import Image
-
-import torch
-from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
-from unet.unet_model import UNet
+import torch
+import torch.nn.functional as F
 
-# 与 train.py 一致的路径与设置
-BASE_DIR = Path(r"E:\Eelgrass_processed_images_2025\Alaska")
-IMAGE_DIR = BASE_DIR / "image"
-INDEX_DIR = BASE_DIR / "index"   # 仅用于 size/名称匹配，不用读取掩膜
-GLCM_DIR  = BASE_DIR / "glcm"
-SPLITS_DIR = BASE_DIR / "splits"
-CKPT_PATH  = BASE_DIR / "checkpoints" / "best.pth"
+from unet.unet_model import UNet  # 你仓库里的 UNet 入口
 
-# 输出
-OUT_DIR = BASE_DIR / "predictions"   # 将在其下创建 split 子目录
+# ===== 路径 & 选项（与训练保持一致）=====
+BASE      = Path(r"E:\Eelgrass_processed_images_2025\Alaska")
+DIR_IMG   = BASE / "image"
+DIR_MASK  = BASE / "index"        # 若 test 有 GT，可用于简单对比统计；没有也可运行
+DIR_GLCM  = BASE / "glcm"
+DIR_SPLIT = BASE / "splits"
+DIR_CKPT  = BASE / "checkpoints"
+OUT_DIR   = BASE / "pred"         # 二值掩膜输出目录
+VIZ_DIR   = BASE / "pred_viz"     # 可选可视化叠加
 
-# 选择预测哪个 split：'train' | 'val' | 'test'
-SPLIT = "test"
+IMG_SIZE    = 768                 # 与 train_update.py 一致
+EXTRA_MODE  = "append4"           # None | "append4" | "replace_red"
+THRESH      = 0.5                 # 默认阈值
+SAVE_VIZ    = True                # 保存叠加可视化
 
-# 模型/数据集设置（需与训练一致）
-CLASSES: int = 1
-BILINEAR: bool = False
-SCALE: float = 1.0
-EXTRA_MODE: Optional[str] = "append4"  # None | 'append4' | 'replace_red'
-WORKERS: int = 4
-BATCH_SIZE: int = 1   # 保存逐张；设 1 便于文件名对应
-AMP: bool = True
+VALID_EXTS = [".png",".jpg",".jpeg",".tif",".tiff",".bmp"]
 
-# 保存哪些产物
-SAVE_MASK: bool = True
-SAVE_OVERLAY: bool = True
-SAVE_PROB: bool = True   # 仅二分类有效
-OVERLAY_ALPHA: float = 0.4
+def find_first(folder: Path, stem: str) -> Path:
+    for ext in VALID_EXTS:
+        p = folder / f"{stem}{ext}"
+        if p.exists():
+            return p
+    m = list(folder.glob(stem + ".*"))
+    if not m:
+        raise FileNotFoundError(f"not found: {folder}/{stem}.*")
+    return m[0]
 
+def resize_longest_side(pil_img: Image.Image, target: int, is_mask: bool) -> Image.Image:
+    w, h = pil_img.size
+    if max(w, h) == target:
+        return pil_img
+    scale = float(target) / float(max(w, h))
+    new_w = int(round(w * scale))
+    new_h = int(round(h * scale))
+    return pil_img.resize((new_w, new_h), Image.NEAREST if is_mask else Image.BILINEAR)
 
-# ---------------- Dataset（与 train.py 同逻辑） ----------------
-class SegDataset(Dataset):
-    def __init__(self,
-                 images_dir: Path,
-                 masks_dir: Path,
-                 split_list_file: Path,
-                 scale: float = 1.0,
-                 dir_extra: Optional[Path] = None,
-                 extra_mode: Optional[str] = None,
-                 valid_exts: Optional[List[str]] = None):
-        self.images_dir = Path(images_dir)
-        self.masks_dir = Path(masks_dir)
-        self.scale = scale
-        self.dir_extra = Path(dir_extra) if dir_extra else None
-        self.extra_mode = extra_mode
-        self.valid_exts = set(e.lower() for e in (valid_exts or [".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"]))
+def pad_to_square(pil_img: Image.Image, target: int, fill=0) -> Image.Image:
+    w, h = pil_img.size
+    if (w, h) == (target, target):
+        return pil_img
+    canvas = Image.new(pil_img.mode, (target, target), color=fill)
+    canvas.paste(pil_img, (0, 0))
+    return canvas
 
-        with open(split_list_file, "r", encoding="utf-8") as f:
-            self.ids = [line.strip() for line in f if line.strip()]
-        if not self.ids:
-            raise RuntimeError(f"Split list is empty: {split_list_file}")
+def pil_to_chw_float(pil_img: Image.Image) -> np.ndarray:
+    if pil_img.mode != "RGB":
+        pil_img = pil_img.convert("RGB")
+    arr = np.asarray(pil_img).transpose(2, 0, 1).astype(np.float32)
+    if (arr > 1).any():
+        arr /= 255.0
+    return arr
 
-    def __len__(self):
-        return len(self.ids)
-
-    def _find_first(self, folder: Path, stem: str) -> Path:
-        for ext in self.valid_exts:
-            p = folder / f"{stem}{ext}"
-            if p.exists():
-                return p
-        matches = list(folder.glob(f"{stem}.*"))
-        if not matches:
-            raise FileNotFoundError(f"File not found for {stem} in {folder}")
-        return matches[0]
-
-    @staticmethod
-    def _resize(img: Image.Image, scale: float, is_mask: bool):
-        if scale == 1.0:
-            return img
-        w, h = img.size
-        newW, newH = int(w * scale), int(h * scale)
-        assert newW > 0 and newH > 0
-        return img.resize((newW, newH), Image.NEAREST if is_mask else Image.BILINEAR)
-
-    def _pil_to_chw_float(self, pil_img: Image.Image) -> np.ndarray:
-        if pil_img.mode != "RGB":
-            pil_img = pil_img.convert("RGB")
-        arr = np.asarray(pil_img).transpose(2, 0, 1).astype(np.float32)
-        if (arr > 1).any():
-            arr /= 255.0
-        return arr
-
-    def __getitem__(self, idx):
-        stem = self.ids[idx]
-        ip = self._find_first(self.images_dir, stem)
-        img = Image.open(ip)
-        img_orig = img.copy()  # for overlay
-
-        img = self._resize(img, SCALE, is_mask=False)
-        img_arr = self._pil_to_chw_float(img)
-
-        if GLCM_DIR.exists() and EXTRA_MODE is not None:
-            ep = self._find_first(GLCM_DIR, stem)
-            extra = Image.open(ep)
-            if extra.mode != "L":
-                extra = extra.convert("L")
-            extra = self._resize(extra, SCALE, is_mask=False)
-            extra_arr = np.asarray(extra).astype(np.float32)
-            if (extra_arr > 1).any():
-                extra_arr /= 255.0
-            extra_arr = extra_arr[None, ...]
-            if EXTRA_MODE == "replace_red":
-                img_arr[0:1, ...] = extra_arr
-            elif EXTRA_MODE == "append4":
-                img_arr = np.concatenate([img_arr, extra_arr], axis=0)
-
-        return {
-            "image": torch.from_numpy(img_arr.copy()).float().contiguous(),
-            "stem": stem,
-            "img_orig": img_orig  # PIL
-        }
-
-
-# ----------------- 可视化与保存 -----------------
-def _palette_k(k: int) -> np.ndarray:
-    rng = np.random.default_rng(2025)
-    pal = rng.integers(0, 256, size=(k, 3), dtype=np.uint8)
-    pal[0] = np.array([0,0,0], dtype=np.uint8)  # 背景=黑色
-    return pal
-
-def save_mask_png(mask: np.ndarray, out_path: Path):
-    """mask: HxW uint8（类别 id）"""
-    Image.fromarray(mask.astype(np.uint8)).save(out_path)
-
-def save_overlay(img_pil: Image.Image, mask: np.ndarray, out_path: Path, alpha: float = 0.4):
-    img = np.asarray(img_pil.convert("RGB")).astype(np.uint8)
-    if CLASSES == 1:
-        # 二分类：前景绿色
-        color = np.array([0,255,0], dtype=np.uint8)
-        over = img.copy()
-        over[mask==1] = (alpha*color + (1-alpha)*over[mask==1]).astype(np.uint8)
-    else:
-        pal = _palette_k(CLASSES)
-        color_mask = pal[mask]  # HxWx3
-        over = (alpha*color_mask + (1-alpha)*img).astype(np.uint8)
-    Image.fromarray(over).save(out_path)
-
-def save_prob_png(prob: np.ndarray, out_path: Path):
-    """prob: HxW float32 [0,1] -> 0..255"""
-    arr = np.clip(prob, 0, 1) * 255.0
-    Image.fromarray(arr.astype(np.uint8)).save(out_path)
-
-
+@torch.no_grad()
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    split_file = SPLITS_DIR / f"{SPLIT}.txt"
-    ds = SegDataset(IMAGE_DIR, INDEX_DIR, split_file, scale=SCALE, dir_extra=GLCM_DIR, extra_mode=EXTRA_MODE)
-    loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=min(WORKERS, os.cpu_count() or 0),
-                        pin_memory=True, persistent_workers=(WORKERS>0))
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    if SAVE_VIZ:
+        VIZ_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 探测通道并构建模型
-    in_ch = next(iter(loader))["image"].shape[1]
-    model = UNet(n_channels=in_ch, n_classes=CLASSES, bilinear=BILINEAR).to(device)
-    ckpt = torch.load(CKPT_PATH, map_location=device)
-    model.load_state_dict(ckpt)
+    stems = [s.strip() for s in (DIR_SPLIT / "test.txt").read_text(encoding="utf-8").splitlines() if s.strip()]
+    if not stems:
+        raise RuntimeError("splits/test.txt is empty or missing.")
+
+    # 探测输入通道数
+    sample_img = Image.open(find_first(DIR_IMG, stems[0])).convert("RGB")
+    c_in = 3
+    if EXTRA_MODE in ("append4","replace_red"):
+        c_in = 4 if EXTRA_MODE == "append4" else 3  # replace_red 仍是3通道
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = UNet(n_channels=c_in, n_classes=1, bilinear=False).to(device)
+    ckpt = DIR_CKPT / "best.pth"
+    model.load_state_dict(torch.load(ckpt, map_location=device))
     model.eval()
 
-    out_split_dir = OUT_DIR / SPLIT
-    (out_split_dir / "mask").mkdir(parents=True, exist_ok=True)
-    if SAVE_OVERLAY: (out_split_dir / "overlay").mkdir(parents=True, exist_ok=True)
-    if SAVE_PROB and CLASSES == 1: (out_split_dir / "prob").mkdir(parents=True, exist_ok=True)
+    pbar = tqdm(stems, desc="Predicting test set")
+    for stem in pbar:
+        ipath = find_first(DIR_IMG, stem)
+        img0  = Image.open(ipath).convert("RGB")
+        orig_w, orig_h = img0.size
 
-    with torch.no_grad():
-        pbar = tqdm(loader, desc=f"Predict {SPLIT}", unit="img")
-        for batch in pbar:
-            x = batch["image"].to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
-            stems = batch["stem"]
-            imgs_orig = batch["img_orig"]
+        # 预处理（与训练一致）
+        img_rs  = resize_longest_side(img0, IMG_SIZE, is_mask=False)
+        img_pad = pad_to_square(img_rs, IMG_SIZE, fill=0)
+        x_arr   = pil_to_chw_float(img_pad)
 
-            with torch.autocast(device.type if device.type != "mps" else "cpu", enabled=AMP):
-                logits = model(x)
+        if EXTRA_MODE in ("append4","replace_red"):
+            gp = find_first(DIR_GLCM, stem)
+            g   = Image.open(gp)
+            if g.mode != "L":
+                g = g.convert("L")
+            g_rs  = resize_longest_side(g, IMG_SIZE, is_mask=False)
+            g_pad = pad_to_square(g_rs, IMG_SIZE, fill=0)
+            g_arr = np.asarray(g_pad).astype(np.float32)
+            if (g_arr > 1).any(): g_arr /= 255.0
+            g_arr = g_arr[None, ...]  # 1xSxS
+            if EXTRA_MODE == "replace_red":
+                x_arr[0:1, ...] = g_arr
+            else:
+                x_arr = np.concatenate([x_arr, g_arr], axis=0)  # 4xSxS
 
-            for i in range(x.size(0)):
-                stem = stems[i]
-                img_pil = imgs_orig[i]
+        x = torch.from_numpy(x_arr).unsqueeze(0).to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
+        logit = model(x)                    # (1,1,S,S)
+        prob  = torch.sigmoid(logit)[0,0]   # (S,S)
+        # 去 pad：这里 pad 是右下角方向；原缩放后尺寸：
+        rs_w, rs_h = img_rs.size
+        prob_np = prob[:rs_h, :rs_w].detach().cpu().numpy()
 
-                if CLASSES == 1:
-                    prob = torch.sigmoid(logits[i:i+1]).squeeze().cpu().numpy()
-                    mask = (prob > 0.5).astype(np.uint8)
-                    if SAVE_PROB:
-                        save_prob_png(prob, out_split_dir / "prob" / f"{stem}.png")
-                else:
-                    pred = torch.argmax(logits[i], dim=0).cpu().numpy().astype(np.uint8)
-                    mask = pred
+        # 还原到原图尺寸
+        prob_img = Image.fromarray((prob_np*255).astype(np.uint8), mode="L")
+        prob_up  = prob_img.resize((orig_w, orig_h), Image.BILINEAR)
+        pred_bin = (np.array(prob_up) / 255.0) > THRESH
+        pred_bin = (pred_bin.astype(np.uint8) * 255)
 
-                if SAVE_MASK:
-                    save_mask_png(mask, out_split_dir / "mask" / f"{stem}.png")
-                if SAVE_OVERLAY:
-                    save_overlay(img_pil, mask, out_split_dir / "overlay" / f"{stem}.png", alpha=OVERLAY_ALPHA)
+        # 保存掩膜
+        out_mask = OUT_DIR / f"{stem}.png"
+        Image.fromarray(pred_bin, mode="L").save(out_mask)
 
-    print(f"✅ Done. Saved to: {out_split_dir.resolve()}")
+        if SAVE_VIZ:
+            # 简易叠加：将掩膜以红色覆盖
+            rgb = img0.copy().convert("RGBA")
+            overlay = Image.fromarray(np.zeros((orig_h, orig_w, 4), dtype=np.uint8), mode="RGBA")
+            rr = (pred_bin > 0).astype(np.uint8) * 255
+            ov = np.stack([rr, np.zeros_like(rr), np.zeros_like(rr), (rr*0.4).astype(np.uint8)], axis=-1)  # 半透明 red
+            overlay = Image.fromarray(ov, mode="RGBA")
+            blended = Image.alpha_composite(rgb, overlay).convert("RGB")
+            blended.save(VIZ_DIR / f"{stem}.jpg")
 
+    print(f"✅ Done. Masks @ {OUT_DIR}")
+    if SAVE_VIZ:
+        print(f"✅ Viz  @ {VIZ_DIR}")
 
 if __name__ == "__main__":
     main()

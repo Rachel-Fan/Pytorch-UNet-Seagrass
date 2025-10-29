@@ -205,7 +205,7 @@ def save_pr_curves_figure(pr_curves: Dict, out_path):
     fig.savefig(out_path, dpi=180)
     plt.close(fig)
 
-
+'''
 # ---------- 主评估入口 ----------
 @torch.no_grad()
 def eval_on_loader(model, loader, device, num_classes: int,
@@ -277,6 +277,210 @@ def eval_on_loader(model, loader, device, num_classes: int,
     pr_curves: Dict = {}
     if num_classes == 1:
         prob = torch.sigmoid(logits_all).squeeze(1).cpu().numpy()
+        tgt01 = targets_all.cpu().numpy().astype(np.uint8)
+        pr_curves["binary"] = _pr_binary(prob, tgt01)
+    else:
+        macro, per_class = _pr_multiclass(logits_all, targets_all, num_classes, include_background=include_background)
+        pr_curves["macro"] = macro
+        pr_curves["per_class"] = per_class
+
+    metrics = dict(dice=dice, miou=miou, acc=acc, prec=prec, rec=rec, f1=f1,
+                   b_iou=b_iou, b_f1=b_f1)
+    return metrics, cm_total, pr_curves
+'''
+
+
+@torch.no_grad()
+def eval_on_loader(model, loader, device, num_classes: int,
+                   amp: bool = False, pr_points: int = 40,
+                   include_background: bool = False):
+    """
+    返回：
+      metrics: dict(dice, miou, acc, prec, rec, f1, b_iou, b_f1)
+      cm: KxK numpy array
+      pr_curves: dict
+    说明：
+      若 batch 含有 'meta' 与 'mask_orig'，则对预测进行 “去pad+反缩放回原尺寸” 后再计算指标。
+      否则按输入张量尺寸直接评估。
+    """
+    def _invert_to_orig(pred_or_prob: torch.Tensor, meta: dict, is_prob: bool, mode: str) -> torch.Tensor:
+        """
+        pred_or_prob:  N x H x W（类别id或概率）或 N x C x H x W（logits/概率）
+        mode: 'argmax'（多分类类别图）, 'bin'（二分类阈后0/1）, 'prob'（二分类概率） or 'logits'（多分类logits）
+        返回：反映射到原尺寸（逐样本处理，拼回batch）
+        """
+        S = meta['sam_img_size'] if 'sam_img_size' in meta else pred_or_prob.shape[-1]
+        # 标准化为 NxHxW（类别/概率/二值）或 NxCxHxW（logits）
+        if mode == 'logits':
+            # 多分类 logits：N x C x S x S
+            x = pred_or_prob
+        else:
+            # 类别/概率/二值：N x S x S
+            x = pred_or_prob
+
+        outs = []
+        N = x.shape[0]
+        for i in range(N):
+            m = loader.dataset  # 取不到逐样本 meta？我们从 batch 提供 meta[i]
+            # 实际从 batch_meta 读取
+            outs.append(None)  # 占位
+        # 这里实际逻辑在外层循环里处理（见下）
+
+        return pred_or_prob  # 占位：函数本体在下面直接实现逐样本处理
+
+    # 真正实现：外层逐 batch 做，为了访问 batch['meta'][i]
+    model.eval()
+    dice_sum = 0.0
+    miou_sum = 0.0
+    cm_total = np.zeros((num_classes, num_classes), dtype=np.int64)
+    b_iou_list, b_f1_list = [], []
+    all_logits_list = []   # 存“反变换后”的 logits/概率 用于 PR
+    all_targets_list = []  # 存“原始尺寸”的 mask（若可得）或当前尺寸的 mask
+
+    for batch in loader:
+        imgs = batch["image"].to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
+        gts  = batch["mask"].to(device=device, dtype=torch.long)
+
+        # 是否带原始信息（由我们新的 SegDataset 提供）
+        has_meta = ("meta" in batch) and ("mask_orig" in batch)
+
+        with torch.autocast(device.type if device.type != "mps" else "cpu", enabled=amp):
+            logits = model(imgs)
+
+        if has_meta:
+            # 逐样本反变换：去pad（到 resized_size） -> 缩回原尺寸
+            metas = batch["meta"]            # list[dict]
+            mask_orig = batch["mask_orig"]   # N x H_orig x W_orig
+
+            if num_classes > 1:
+                # 多分类：logits -> 去 pad -> 缩回原尺寸 -> 再 argmax
+                preds_list = []
+                logits_list = []
+                for i in range(logits.size(0)):
+                    m = metas[i]
+                    rs_h, rs_w = m["resized_size"]
+                    pad_b, pad_r = m["pad"]
+                    # 去pad
+                    crop = logits[i, :, :rs_h, :rs_w].unsqueeze(0)
+                    # 回原尺寸
+                    crop_rs = F.interpolate(crop, size=mask_orig[i].shape[-2:], mode="bilinear", align_corners=False)
+                    logits_list.append(crop_rs)
+                    preds_list.append(torch.argmax(crop_rs, dim=1))
+                logits_restored = torch.cat(logits_list, dim=0)         # N x C x H0 x W0
+                preds_restored  = torch.cat(preds_list,  dim=0).squeeze(1)  # N x H0 x W0
+                gts_use = mask_orig.to(device=device, dtype=torch.long)     # 原始尺寸
+                # 指标
+                dice_sum += _dice_multiclass(logits_restored, gts_use)
+                miou_sum += _iou_multiclass(preds_restored, gts_use, num_classes)
+                bi, bf = _boundary_iou_f1_multiclass(preds_restored, gts_use, num_classes, include_background=include_background)
+                # 混淆矩阵
+                cm_batch = confusion_matrix(gts_use.view(-1).cpu().numpy(),
+                                            preds_restored.view(-1).cpu().numpy(),
+                                            labels=list(range(num_classes)))
+                cm_total += cm_batch
+                # PR 缓存（使用反变换后的 logits）
+                all_logits_list.append(logits_restored.cpu())
+                all_targets_list.append(gts_use.cpu())
+
+            else:
+                # 二分类：sigmoid -> 去pad -> 回原 -> 阈0.5 得 preds
+                probs_list = []
+                preds_list = []
+                for i in range(logits.size(0)):
+                    m = metas[i]
+                    rs_h, rs_w = m["resized_size"]
+                    crop = torch.sigmoid(logits[i:i+1, :, :rs_h, :rs_w])  # 1x1xhxw
+                    crop_rs = F.interpolate(crop, size=batch["mask_orig"][i].shape[-2:], mode="bilinear", align_corners=False)
+                    probs_list.append(crop_rs.squeeze(0))  # 1xH0xW0
+                    preds_list.append((crop_rs > 0.5).long().squeeze(0))  # 1xH0xW0 -> H0xW0
+                prob_restored = torch.cat(probs_list, dim=0).squeeze(1)   # N x H0 x W0
+                preds_restored = torch.cat(preds_list, dim=0).squeeze(1)  # N x H0 x W0
+                gts_use = batch["mask_orig"].to(device=device, dtype=torch.long)
+
+                # 指标
+                # 用原始 logits 重算 dice（二分类版本可直接用概率）
+                # 这里直接做 dice on probabilities:
+                # 做个假的 logits_all = logit(prob) 也可，但这里沿用 dice_binary 概念即可
+                # 为保持一致性，重用现有的二分类 Dice 计算：用“logits”的接口不方便，这里手工实现：
+                inter = (prob_restored * gts_use.float()).sum(dim=(1,2))
+                denom = prob_restored.sum(dim=(1,2)) + gts_use.float().sum(dim=(1,2)) + 1e-6
+                dice_sum += (2*inter/denom).mean().item()
+
+                miou_sum += _iou_binary(preds_restored, gts_use)
+                # Boundary
+                pn = preds_restored.cpu().numpy().astype(np.uint8)
+                tn = gts_use.cpu().numpy().astype(np.uint8)
+                bi_list, bf_list = [], []
+                for i in range(pn.shape[0]):
+                    iou_b, f1_b = _boundary_iou_f1_binary_np(pn[i], tn[i])
+                    bi_list.append(iou_b); bf_list.append(f1_b)
+                bi = float(np.nanmean(bi_list)); bf = float(np.nanmean(bf_list))
+                b_iou_list.append(bi); b_f1_list.append(bf)
+
+                # 混淆矩阵
+                cm_batch = confusion_matrix(gts_use.view(-1).cpu().numpy(),
+                                            preds_restored.view(-1).cpu().numpy(),
+                                            labels=[0,1])
+                cm_total += cm_batch
+
+                # PR 用反变换后的概率
+                all_logits_list.append(prob_restored.unsqueeze(1).cpu())  # 还给成 Nx1xH0xW0 以便统一
+                all_targets_list.append(gts_use.cpu())
+
+            # 注意：has_meta 分支里 b_iou/b_f1 已经 append 了；多分类也要 append
+            if num_classes > 1:
+                b_iou_list.append(bi); b_f1_list.append(bf)
+
+        else:
+            # === 没有 meta：按原先维度评估（兼容旧数据集） ===
+            if num_classes > 1:
+                dice_sum += _dice_multiclass(logits, gts)
+                preds = logits.argmax(dim=1)
+                miou_sum += _iou_multiclass(preds, gts, num_classes)
+                bi, bf = _boundary_iou_f1_multiclass(preds, gts, num_classes, include_background=include_background)
+                cm_total += confusion_matrix(gts.view(-1).cpu().numpy(),
+                                             preds.view(-1).cpu().numpy(),
+                                             labels=list(range(num_classes)))
+                all_logits_list.append(logits.cpu())
+                all_targets_list.append(gts.cpu())
+                b_iou_list.append(bi); b_f1_list.append(bf)
+            else:
+                dice_sum += _dice_binary(logits, gts)
+                prob = torch.sigmoid(logits).squeeze(1)
+                preds = (prob > 0.5).long()
+                miou_sum += _iou_binary(preds, gts)
+                pn = preds.cpu().numpy().astype(np.uint8)
+                tn = gts.cpu().numpy().astype(np.uint8)
+                bi_list, bf_list = [], []
+                for i in range(pn.shape[0]):
+                    iou_b, f1_b = _boundary_iou_f1_binary_np(pn[i], tn[i])
+                    bi_list.append(iou_b); bf_list.append(f1_b)
+                bi = float(np.nanmean(bi_list)); bf = float(np.nanmean(bf_list))
+                b_iou_list.append(bi); b_f1_list.append(bf)
+                cm_total += confusion_matrix(gts.view(-1).cpu().numpy(),
+                                             preds.view(-1).cpu().numpy(),
+                                             labels=[0,1])
+                all_logits_list.append(logits.cpu())
+                all_targets_list.append(gts.cpu())
+
+    # 汇总
+    n_batches = max(1, len(loader))
+    dice = dice_sum / n_batches
+    miou = miou_sum / n_batches
+    b_iou = float(np.nanmean(b_iou_list)) if len(b_iou_list)>0 else 0.0
+    b_f1  = float(np.nanmean(b_f1_list))  if len(b_f1_list)>0 else 0.0
+    acc, prec, rec, f1 = _acc_prec_rec_f1_from_cm(cm_total)
+
+    # 生成 PR 曲线（整体）
+    logits_all = torch.cat(all_logits_list, dim=0)
+    targets_all = torch.cat(all_targets_list, dim=0)
+    pr_curves: Dict = {}
+    if num_classes == 1:
+        # logits_all 在 has_meta 分支里我们存的是概率 Nx1xH0xW0，这里统一处理
+        if logits_all.dim() == 4 and logits_all.size(1) == 1:
+            prob = logits_all.squeeze(1).cpu().numpy()
+        else:
+            prob = torch.sigmoid(logits_all).squeeze(1).cpu().numpy()
         tgt01 = targets_all.cpu().numpy().astype(np.uint8)
         pr_curves["binary"] = _pr_binary(prob, tgt01)
     else:
