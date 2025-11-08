@@ -51,12 +51,12 @@ DIR_IMG    = BASE_DIR / "image"
 DIR_MASK   = BASE_DIR / "index"
 DIR_GLCM   = BASE_DIR / "glcm"               # 可选
 DIR_SPLITS = BASE_DIR / "splits"
-DIR_CKPT   = BASE_DIR / "checkpoints"
+DIR_CKPT   = BASE_DIR / "rbg/train-run1/checkpoints"
 DIR_CACHE  = BASE_DIR / "cache"              # 若存在将启用加速
 
 # 数据/模型设置
 IMG_SIZE   = 768                              # 之前 1024 -> 768（或 640 继续提速）
-EXTRA_MODE: Optional[str] = "append4"         # None | 'append4' | 'replace_red'
+EXTRA_MODE: Optional[str] = "None"         # None | 'append4' | 'replace_red'
 CLASSES    = 1                                # 1=二分类；>1=多分类
 BILINEAR   = False
 # ==== config ====
@@ -81,7 +81,7 @@ AMP_ENABLED = True
 CUDNN_BENCH = True
 
 # 其他
-SAVE_EVERY_EPOCH = False
+SAVE_EVERY_EPOCH = True
 SEED = 0
 # ===========================================================
 

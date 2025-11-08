@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-predict.py — 读取 test.txt，生成同尺寸预测掩膜（0/1 PNG）及可选叠加图
-硬编码数据根目录：E:\Eelgrass_processed_images_2025\Alaska
-要求：best.pth 已在 checkpoints 目录
-依赖：torch, numpy, pillow, tqdm
+predict_scratch.py — 用“未训练”的 UNet 随机权重在 test.txt 上做推理
+- 与 train_update.py 的前处理一致（最长边缩放到 IMG_SIZE，再右/下 pad 到方形）
+- 与 predict.py 一致的尺寸回填与可视化
+- 不加载任何 checkpoint（纯随机初始化）
+- 输出目录：pred_scratch/ 与 pred_scratch_viz/
+⚠️ 注意：输出掩膜仅用于验证推理/IO流程是否跑通，效果随机、无实际意义
 """
 
 import os
@@ -24,17 +26,20 @@ from unet.unet_model import UNet  # 你仓库里的 UNet 入口
 # ===== 路径 & 选项（与训练保持一致）=====
 BASE      = Path(r"E:\Eelgrass_processed_images_2025\Alaska")
 DIR_IMG   = BASE / "image"
-DIR_MASK  = BASE / "index"        # 若 test 有 GT，可用于简单对比统计；没有也可运行
 DIR_GLCM  = BASE / "glcm"
 DIR_SPLIT = BASE / "splits"
-DIR_CKPT  = BASE / "rgb/train-run1/checkpoints"
-OUT_DIR   = BASE / "rgb/train-run1/pred"         # 二值掩膜输出目录
-VIZ_DIR   = BASE / "rgb/train-run1/pred_viz"     # 可选可视化叠加
+OUT_DIR   = BASE / "pred_scratch"       # 二值掩膜输出目录（随机权重）
+VIZ_DIR   = BASE / "pred_scratch_viz"   # 可视化叠加（随机权重）
 
-IMG_SIZE    = 768                 # 与 train_update.py 一致
-EXTRA_MODE  = "None"           # None | "append4" | "replace_red"
-THRESH      = 0.5                 # 默认阈值
-SAVE_VIZ    = True                # 保存叠加可视化
+IMG_SIZE    = 768                       # 与 train_update.py 一致
+EXTRA_MODE  = "NONE"                 # None | "append4" | "replace_red"
+THRESH      = 0.5
+SAVE_VIZ    = True
+
+# 为了可复现的“随机”，固定种子（可删）
+SEED = 0
+torch.manual_seed(SEED)
+np.random.seed(SEED)
 
 VALID_EXTS = [".png",".jpg",".jpeg",".tif",".tiff",".bmp"]
 
@@ -83,24 +88,25 @@ def main():
     if not stems:
         raise RuntimeError("splits/test.txt is empty or missing.")
 
-    # 探测输入通道数
-    sample_img = Image.open(find_first(DIR_IMG, stems[0])).convert("RGB")
+    # 动态探测输入通道（和训练的 EXTRA_MODE 一致）
     c_in = 3
-    if EXTRA_MODE in ("append4","replace_red"):
-        c_in = 4 if EXTRA_MODE == "append4" else 3  # replace_red 仍是3通道
+    if EXTRA_MODE == "append4":
+        c_in = 4
+    elif EXTRA_MODE == "replace_red":
+        c_in = 3
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = UNet(n_channels=c_in, n_classes=1, bilinear=False).to(device)
-    ckpt = DIR_CKPT / "best.pth"
-    model.load_state_dict(torch.load(ckpt, map_location=device))
     model.eval()
+    print("[scratch] Using randomly initialized UNet (no checkpoint loaded).")
 
-    pbar = tqdm(stems, desc="Predicting test set")
+    pbar = tqdm(stems, desc="Predicting with random UNet")
     for stem in pbar:
         ipath = find_first(DIR_IMG, stem)
         img0  = Image.open(ipath).convert("RGB")
         orig_w, orig_h = img0.size
 
-        # 预处理（与训练一致）
+        # 预处理（与训练保持一致）
         img_rs  = resize_longest_side(img0, IMG_SIZE, is_mask=False)
         img_pad = pad_to_square(img_rs, IMG_SIZE, fill=0)
         x_arr   = pil_to_chw_float(img_pad)
@@ -113,43 +119,43 @@ def main():
             g_rs  = resize_longest_side(g, IMG_SIZE, is_mask=False)
             g_pad = pad_to_square(g_rs, IMG_SIZE, fill=0)
             g_arr = np.asarray(g_pad).astype(np.float32)
-            if (g_arr > 1).any(): g_arr /= 255.0
+            if (g_arr > 1).any():
+                g_arr /= 255.0
             g_arr = g_arr[None, ...]  # 1xSxS
             if EXTRA_MODE == "replace_red":
                 x_arr[0:1, ...] = g_arr
-            else:
-                x_arr = np.concatenate([x_arr, g_arr], axis=0)  # 4xSxS
+            else:  # append4
+                x_arr = np.concatenate([x_arr, g_arr], axis=0)
 
         x = torch.from_numpy(x_arr).unsqueeze(0).to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
-        logit = model(x)                    # (1,1,S,S)
-        prob  = torch.sigmoid(logit)[0,0]   # (S,S)
-        # 去 pad：这里 pad 是右下角方向；原缩放后尺寸：
+        logit = model(x)                  # (1,1,S,S)
+        prob  = torch.sigmoid(logit)[0,0] # (S,S)
+
+        # 去 pad（右/下），再还原到原图尺寸
         rs_w, rs_h = img_rs.size
         prob_np = prob[:rs_h, :rs_w].detach().cpu().numpy()
-
-        # 还原到原图尺寸
         prob_img = Image.fromarray((prob_np*255).astype(np.uint8), mode="L")
         prob_up  = prob_img.resize((orig_w, orig_h), Image.BILINEAR)
+
+        # 二值化
         pred_bin = (np.array(prob_up) / 255.0) > THRESH
         pred_bin = (pred_bin.astype(np.uint8) * 255)
 
-        # 保存掩膜
-        out_mask = OUT_DIR / f"{stem}.png"
-        Image.fromarray(pred_bin, mode="L").save(out_mask)
+        # 保存随机权重推理掩膜
+        Image.fromarray(pred_bin, mode="L").save(OUT_DIR / f"{stem}.png")
 
         if SAVE_VIZ:
-            # 简易叠加：将掩膜以红色覆盖
+            # 半透明红色覆盖
             rgb = img0.copy().convert("RGBA")
-            overlay = Image.fromarray(np.zeros((orig_h, orig_w, 4), dtype=np.uint8), mode="RGBA")
             rr = (pred_bin > 0).astype(np.uint8) * 255
-            ov = np.stack([rr, np.zeros_like(rr), np.zeros_like(rr), (rr*0.4).astype(np.uint8)], axis=-1)  # 半透明 red
+            ov = np.stack([rr, np.zeros_like(rr), np.zeros_like(rr), (rr*0.4).astype(np.uint8)], axis=-1)
             overlay = Image.fromarray(ov, mode="RGBA")
             blended = Image.alpha_composite(rgb, overlay).convert("RGB")
             blended.save(VIZ_DIR / f"{stem}.jpg")
 
-    print(f"✅ Done. Masks @ {OUT_DIR}")
+    print(f"✅ Done. Random masks @ {OUT_DIR}")
     if SAVE_VIZ:
-        print(f"✅ Viz  @ {VIZ_DIR}")
+        print(f"✅ Viz (random) @ {VIZ_DIR}")
 
 if __name__ == "__main__":
     main()
