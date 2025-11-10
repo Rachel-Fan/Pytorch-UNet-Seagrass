@@ -426,6 +426,7 @@ from pathlib import Path
 from typing import Optional, Dict, List
 import numpy as np
 from PIL import Image
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -476,16 +477,34 @@ SAVE_EVERY_EPOCH = False
 # ===================== 工具函数 =====================
 VALID_EXTS = [".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"]
 
+
+
 def find_first(folder: Path, stem: str) -> Path:
-    """在 folder 下按常见后缀找到第一匹配文件；否则抛错。"""
+    """
+    在 folder 下查找给定 stem 对应的图像文件：
+    - 传入的 stem 可以是 'du_bc_19_row10_col26' 或 'du_bc_19_row10_col26.png'
+    - 自动去扩展名、大小写无关匹配、标准化路径分隔符
+    """
+    folder = Path(folder).resolve()
+
+    # 统一：去掉传入 stem 的扩展名，并做小写比较
+    target_stem = Path(stem).stem.lower()
+
+    # 先尝试直接拼接常见扩展名（快路径）
     for ext in VALID_EXTS:
-        p = folder / f"{stem}{ext}"
+        p = (folder / f"{target_stem}{ext}").resolve()
         if p.exists():
             return p
-    m = list(folder.glob(stem + ".*"))
-    if not m:
-        raise FileNotFoundError(f"not found: {folder}/{stem}.*")
-    return m[0]
+
+    # 若快路径没找到，遍历目录做小写无关匹配（兼容奇怪大小写/后缀）
+    for p in folder.iterdir():
+        if not p.is_file():
+            continue
+        if p.stem.lower() == target_stem and p.suffix.lower() in VALID_EXTS:
+            return p.resolve()
+
+    raise FileNotFoundError(f"not found (checked normalized path): {folder}\\{stem}.*")
+
 
 def pil_to_chw_float(pil_img: Image.Image) -> np.ndarray:
     """PIL -> CxHxW float[0,1]（RGB）"""
@@ -703,7 +722,7 @@ def main():
                            dir_extra=DIR_GLCM if EXTRA_MODE else None,
                            extra_mode=EXTRA_MODE, img_size=IMG_SIZE,
                            cache_dir=DIR_CACHE if use_cache else None)
-    val_set   = SegDataset(DIR_IMG, DIR_MASK, DIR_SPLITS / "val.txt",
+    val_set   = SegDataset(DIR_IMG, DIR_MASK, DIR_SPLITS / "valid.txt",
                            dir_extra=DIR_GLCM if EXTRA_MODE else None,
                            extra_mode=EXTRA_MODE, img_size=IMG_SIZE,
                            cache_dir=DIR_CACHE if use_cache else None)
@@ -718,12 +737,12 @@ def main():
     # —— Model：动态探测输入通道（append4/replace_red 后可能是 4 通道）——
     sample = next(iter(DataLoader(train_set, batch_size=1, shuffle=False, num_workers=0)))
     in_ch = sample["image"].shape[1]
-    model = UNet(n_channels=in_ch, n_classes=N_CLASSES, bilinear=BILINEAR).to(
+    model = UNet(n_channels=in_ch, n_classes=CLASSES, bilinear=BILINEAR).to(
         device=device, memory_format=torch.channels_last
     )
 
     # —— Loss & Optimizer（BCE+Dice，强制二值掩膜）——
-    if N_CLASSES != 1:
+    if CLASSES != 1:
         raise ValueError("本脚本按二分类实现（N_CLASSES=1）。如需多分类请改 CrossEntropy 分支。")
     criterion = nn.BCEWithLogitsLoss()
 
