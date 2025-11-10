@@ -287,3 +287,4 @@ class SegDataset(Dataset):
             'image': torch.as_tensor(img_arr.copy()).float().contiguous(),
             'mask': torch.as_tensor(mask_arr.copy()).long().contiguous()
         }
+        

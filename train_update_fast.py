@@ -437,14 +437,34 @@ from tqdm import tqdm
 
 from unet.unet_model import UNet
 
+'''
 # ===================== 硬编码路径 & 配置（按需修改） =====================
-BASE_DIR   = Path(r"D:\Eelgrass_Process_2025_Bo\DroneVision_Model_data\BC")
+BASE_DIR   = Path(r"D:\Eelgrass_Process_2025_Bo\DroneVision_Model_data\OR")
 DIR_IMG    = BASE_DIR / "image"
 DIR_MASK   = BASE_DIR / "index"
 DIR_GLCM   = BASE_DIR / "glcm"         # 可选
 DIR_SPLITS = BASE_DIR / "splits"
 DIR_CKPT   = BASE_DIR / "train2/checkpoints"
 DIR_CACHE  = BASE_DIR / "train2/cache"
+'''
+
+BASE_DIR = Path(r"D:\Eelgrass_Process_2025_Bo\DroneVision_Model_data\OR")
+
+TR_IMG   = BASE_DIR / "train" / "image"
+TR_MASK  = BASE_DIR / "train" / "index"
+TR_GLCM  = BASE_DIR / "train" / "glcm"     # 可不存在
+
+VA_IMG   = BASE_DIR / "valid" / "image"
+VA_MASK  = BASE_DIR / "valid" / "index"
+VA_GLCM  = BASE_DIR / "valid" / "glcm"     # 可不存在
+
+TE_IMG   = BASE_DIR / "test"  / "image"
+TE_MASK  = BASE_DIR / "test"  / "index"
+TE_GLCM  = BASE_DIR / "test"  / "glcm"     # 可不存在；仅说明结构，用不到也无所谓
+
+DIR_CKPT = BASE_DIR / "train1" / "checkpoints"  # 保存模型
+
+
 
 # ===== 数据/训练设置 =====
 IMG_SIZE        = 512                         # 768 → 640，速度/显存更友好
