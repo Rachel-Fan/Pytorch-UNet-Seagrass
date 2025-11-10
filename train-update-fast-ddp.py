@@ -25,6 +25,7 @@ from typing import Optional, Dict, List, Tuple
 import numpy as np
 from PIL import Image
 import datetime
+import csv, time
 
 import torch
 import torch.nn as nn
@@ -55,6 +56,10 @@ DIR_IDX_VALID  = DIR_VALID / "index"
 DIR_GLCM       = BASE_DIR / "glcm"  # 可选：额外通道（单通道）
 DIR_CACHE      = BASE_DIR / "cache" # 可选：离线缓存
 DIR_CKPT       = BASE_DIR / "train_ddp" / "checkpoints"
+
+DIR_LOGS = BASE_DIR / "train_ddp" / "logs"
+LOG_CSV  = DIR_LOGS / "training_log.csv"
+
 
 # ===== 训练/数据设置 =====
 IMG_SIZE        = 512
@@ -326,8 +331,16 @@ def main():
         print(f"BASE_DIR = {BASE_DIR}")
 
     # 目录创建
+    # 目录创建 + 日志初始化
     if get_rank() == 0:
         DIR_CKPT.mkdir(parents=True, exist_ok=True)
+        DIR_LOGS.mkdir(parents=True, exist_ok=True)
+        # 若 CSV 不存在则写表头
+        if not LOG_CSV.exists():
+            with open(LOG_CSV, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["epoch", "train_loss", "val_dice", "val_mIoU", "lr", "time_sec"])
+
 
     # === 数据集 & 采样器 ===
     extra_needed = (DIR_GLCM.exists() and EXTRA_MODE is not None)
@@ -482,6 +495,28 @@ def main():
                   f"train_loss={epoch_loss/len(train_loader):.4f} | "
                   f"val_dice={val_dice:.4f} | val_mIoU={val_miou:.4f} | "
                   f"lr={optimizer.param_groups[0]['lr']:.2e}")
+            
+                # === 写入训练日志（rank0） ===
+        if get_rank()==0:
+            with open(LOG_CSV, "a", newline="") as f:
+                w = csv.writer(f)
+                w.writerow([
+                    epoch,
+                    round(epoch_loss/len(train_loader), 6),
+                    round(val_dice, 6),
+                    round(val_miou, 6),
+                    float(optimizer.param_groups[0]['lr']),
+                    round(time.time(), 3)
+                ])
+
+        # === 每 2 个 epoch 保存 checkpoint（rank0） ===
+        if get_rank()==0 and (epoch % 2 == 0):
+            ckpt_path = DIR_CKPT / f"checkpoint_epoch{epoch}.pth"
+            torch.save(
+                (model.module.state_dict() if isinstance(model, DDP) else model.state_dict()),
+                ckpt_path
+            )
+
 
         # 保存
         if SAVE_EVERY_EPOCH and get_rank()==0:
