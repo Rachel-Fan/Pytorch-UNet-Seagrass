@@ -1,18 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-train_update_fast_ddp.py — 读取 train/valid/test 文件夹结构，支持单机多卡 DDP，梯度累积/缓存/AMP/二值分割
-目录要求:
-BASE_DIR/
-  train/
-    image/*.png|jpg|tif
-    index/*.png|jpg|tif
-  valid/
-    image/
-    index/
-  test/           # 可选（此脚本训练时未使用）
-    image/
-    index/
-可选：BASE_DIR/glcm/ 以及 BASE_DIR/cache/{image,index,glcm}/*.pt 用于加速
+train_update_fast_ddp.py
+- Reads train/valid/test folder structure with image/ + index/
+- Optional split files (--train-split/--valid-split/--test-split) to restrict to subsets
+- Single-GPU or multi-GPU via DDP (torchrun)
+- Gradient accumulation, channels_last, optional GLCM extra channel
+- Logs to CSV, checkpoints every 2 epochs, saves best.pth / best_model.pth / last.pth
 """
 
 import os
@@ -20,12 +13,15 @@ os.environ["TORCHDYNAMO_DISABLE"] = "1"
 os.environ["TORCHINDUCTOR_DISABLED"] = "1"
 os.environ["TORCH_COMPILE_DISABLE"] = "1"
 
+import argparse
+import csv
+import time
+import datetime
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Set
+
 import numpy as np
 from PIL import Image
-import datetime
-import csv, time
 
 import torch
 import torch.nn as nn
@@ -37,39 +33,20 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 
-# 你的 UNet 实现
+# your UNet
 from unet.unet_model import UNet
 
-# ===================== 硬编码路径 & 配置 =====================
-# 可被环境变量 BASE_DIR 覆盖
-BASE_DIR   = Path(os.environ.get("BASE_DIR", "/content/drive/MyDrive/Drone AI/DroneVision_Model_data/OR"))
+# ===================== defaults (can be overridden by CLI) =====================
+DEFAULT_BASE_DIR = Path(os.environ.get("BASE_DIR", "/content/drive/MyDrive/Drone AI/DroneVision_Model_data/OR"))
 
-DIR_TRAIN  = BASE_DIR / "train"
-DIR_VALID  = BASE_DIR / "valid"     # 注意：你确认了文件夹名是 "valid"
-DIR_TEST   = BASE_DIR / "test"      # 可选
-
-DIR_IMG_TRAIN  = DIR_TRAIN / "image"
-DIR_IDX_TRAIN  = DIR_TRAIN / "index"
-DIR_IMG_VALID  = DIR_VALID / "image"
-DIR_IDX_VALID  = DIR_VALID / "index"
-
-DIR_GLCM       = BASE_DIR / "glcm"  # 可选：额外通道（单通道）
-DIR_CACHE      = BASE_DIR / "cache" # 可选：离线缓存
-DIR_CKPT       = BASE_DIR / "train_ddp" / "checkpoints"
-
-DIR_LOGS = BASE_DIR / "train_ddp" / "logs"
-LOG_CSV  = DIR_LOGS / "training_log.csv"
-
-
-# ===== 训练/数据设置 =====
 IMG_SIZE        = 512
-EXTRA_MODE      = None              # None | 'append4' | 'replace_red'  （使用 GLCM）
-CLASSES         = 1                 # 二分类
+EXTRA_MODE      = None          # None | 'append4' | 'replace_red'
+CLASSES         = 1             # binary
 BILINEAR        = False
 
 EPOCHS        = 10
-BATCH_SIZE    = 4                   # 单进程单步 batch
-ACCUM_STEPS   = 4                   # 梯度累积 => 等效总 batch = BATCH_SIZE * ACCUM_STEPS * world_size
+BATCH_SIZE    = 4
+ACCUM_STEPS   = 4               # effective batch = BATCH_SIZE * ACCUM_STEPS * world_size
 LR            = 3e-5
 WEIGHT_DECAY  = 1e-4
 GRAD_CLIP     = 1.0
@@ -79,17 +56,16 @@ PREFETCH_FACTOR = 2
 PIN_MEMORY      = True
 PERSISTENT      = True
 
-AMP_ENABLED  = False                # 先关 AMP，稳定后再开
+AMP_ENABLED  = False            # start stable; turn on later if needed
 CUDNN_BENCH  = True
 SEED         = 0
 
-SAVE_EVERY_EPOCH = False
+SAVE_EVERY_EPOCH = False        # per-epoch saving (in addition to every 2 epochs below)
 
-# ===================== 工具函数 =====================
+# ===================== helpers =====================
 VALID_EXTS = [".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"]
 
 def find_first(folder: Path, stem: str) -> Path:
-    """在 folder 下按 stem（不带扩展或带扩展）寻找首个匹配文件（大小写不敏感）"""
     folder = Path(folder).resolve()
     target_stem = Path(stem).stem.lower()
     for ext in VALID_EXTS:
@@ -102,7 +78,6 @@ def find_first(folder: Path, stem: str) -> Path:
     raise FileNotFoundError(f"not found: {folder}/{stem}.*")
 
 def pil_to_chw_float(pil_img: Image.Image) -> np.ndarray:
-    """PIL -> CxHxW float[0,1]（RGB）"""
     if pil_img.mode != "RGB":
         pil_img = pil_img.convert("RGB")
     arr = np.asarray(pil_img).transpose(2, 0, 1).astype(np.float32)
@@ -127,7 +102,6 @@ def pad_to_square(pil_img: Image.Image, target: int, fill=0) -> Image.Image:
     return canvas
 
 def load_tensor(path: Path) -> torch.Tensor:
-    """读取 cache .pt；兼容 dict({'tensor': ...}) 或直接 tensor"""
     obj = torch.load(path, map_location='cpu', weights_only=True)
     if isinstance(obj, dict) and "tensor" in obj:
         return obj["tensor"]
@@ -135,7 +109,20 @@ def load_tensor(path: Path) -> torch.Tensor:
         return obj
     raise TypeError(f"Unexpected object in {path}: {type(obj)}")
 
-# ===================== DDP 辅助 =====================
+def load_split_file(txt_path: Path) -> Set[str]:
+    """Return a lowercased set of stems from a split file; ignores blanks and lines starting with #."""
+    stems = set()
+    lines = Path(txt_path).read_text(encoding="utf-8").splitlines()
+    for ln in lines:
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        stems.add(Path(ln).stem.lower())
+    if not stems:
+        raise RuntimeError(f"Empty split file: {txt_path}")
+    return stems
+
+# ===== DDP helpers =====
 def is_dist_avail_and_initialized():
     return dist.is_available() and dist.is_initialized()
 
@@ -146,7 +133,6 @@ def get_world_size():
     return dist.get_world_size() if is_dist_avail_and_initialized() else 1
 
 def reduce_mean(t: torch.Tensor):
-    """跨进程平均，返回各进程相同结果"""
     if not is_dist_avail_and_initialized():
         return t
     rt = t.clone()
@@ -154,30 +140,32 @@ def reduce_mean(t: torch.Tensor):
     rt /= get_world_size()
     return rt
 
-# ===================== Dataset (folder-based) =====================
+# ===================== dataset =====================
 class SegFolderDataset(Dataset):
     """
     split_dir/
       image/*.png|jpg|tif
       index/*.png|jpg|tif
-    掩膜匹配规则：
-      1) index/下同名文件
-      2) 或 <stem>_index.<ext>
-    可选：EXTRA_MODE + GLCM（append4 或 replace_red）
-    可选：cache/{image,index,glcm}/*.pt
+    Mask pairing:
+      1) index/same_name
+      2) <stem>_index.<ext>
+    Optional: EXTRA_MODE + GLCM; cache/{image,index,glcm}/*.pt
+    Optional: stems_allow (subset filter)
     """
     def __init__(self,
                  split_dir: Path,
                  extra_dir: Optional[Path] = None,
                  extra_mode: Optional[str] = None,
                  img_size: int = 512,
-                 cache_dir: Optional[Path] = None):
+                 cache_dir: Optional[Path] = None,
+                 stems_allow: Optional[Set[str]] = None):
         self.split_dir = Path(split_dir)
         self.image_dir = self.split_dir / "image"
         self.index_dir = self.split_dir / "index"
         self.extra_dir = Path(extra_dir) if extra_dir else None
         self.extra_mode = extra_mode
         self.img_size = img_size
+        self.stems_allow = {s.lower() for s in stems_allow} if stems_allow else None
 
         assert self.image_dir.exists(), f"Missing: {self.image_dir}"
         assert self.index_dir.exists(), f"Missing: {self.index_dir}"
@@ -187,6 +175,8 @@ class SegFolderDataset(Dataset):
         for fname in sorted(all_imgs):
             img_p = self.image_dir / fname
             stem = Path(fname).stem
+            if self.stems_allow and (stem.lower() not in self.stems_allow):
+                continue
             m1 = self.index_dir / fname
             m2 = self.index_dir / f"{stem}_index{Path(fname).suffix}"
             if m1.exists():
@@ -227,7 +217,6 @@ class SegFolderDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         img_p, msk_p, stem = self.pairs[idx]
 
-        # 缓存直读
         if self.use_cache:
             img_t = load_tensor(self.cache_dir / "image" / f"{stem}.pt")   # CxSxS
             msk_t = load_tensor(self.cache_dir / "index" / f"{stem}.pt")   # SxS
@@ -241,7 +230,6 @@ class SegFolderDataset(Dataset):
                     "mask":  msk_t.long().contiguous(),
                     "stem":  stem}
 
-        # 现场预处理
         img = Image.open(img_p).convert("RGB")
         msk = Image.open(msk_p)
 
@@ -253,7 +241,7 @@ class SegFolderDataset(Dataset):
             ga = np.asarray(g).astype(np.float32)
             if (ga > 1).any():
                 ga /= 255.0
-            extra_arr = ga[None, ...]  # 1xSxS
+            extra_arr = ga[None, ...]
 
         img_prep = pad_to_square(resize_longest_side(img, self.img_size, is_mask=False), self.img_size, fill=0)
         msk_prep = pad_to_square(resize_longest_side(msk, self.img_size, is_mask=True),  self.img_size, fill=0)
@@ -271,7 +259,7 @@ class SegFolderDataset(Dataset):
                 "mask":  torch.from_numpy(mask_arr.copy()).long().contiguous(),
                 "stem":  stem}
 
-# ===================== 验证（Dice/mIoU，二分类） =====================
+# ===================== validation (binary) =====================
 @torch.no_grad()
 def quick_validate(model: nn.Module, loader: DataLoader, device: torch.device, amp: bool = False):
     model.eval()
@@ -304,9 +292,9 @@ def quick_validate(model: nn.Module, loader: DataLoader, device: torch.device, a
         return 0.0, 0.0
     return dice_sum/n_batches, miou_sum/n_batches
 
-# ===================== 主程序（含 DDP 初始化） =====================
+# ===================== main =====================
 def main():
-    # cuDNN
+    # cuDNN, seeds
     if CUDNN_BENCH:
         torch.backends.cudnn.benchmark = True
     try:
@@ -315,11 +303,31 @@ def main():
         pass
     torch.manual_seed(SEED); np.random.seed(SEED)
 
-    # ==== DDP init ====
+    # CLI
+    parser = argparse.ArgumentParser(description="UNet training with optional split subset & DDP")
+    parser.add_argument("--base-dir", type=str, default=str(DEFAULT_BASE_DIR), help="BASE_DIR root")
+    parser.add_argument("--train-dir", type=str, default=None, help="override train dir (optional)")
+    parser.add_argument("--valid-dir", type=str, default=None, help="override valid dir (optional)")
+    parser.add_argument("--test-dir",  type=str, default=None, help="override test dir (optional)")
+    parser.add_argument("--train-split", type=str, default=None, help="txt with image names for train subset")
+    parser.add_argument("--valid-split", type=str, default=None, help="txt with image names for valid subset")
+    parser.add_argument("--test-split",  type=str, default=None, help="txt with image names for test subset")
+    args = parser.parse_args()
+
+    base_dir = Path(args.base_dir).expanduser()
+    dir_train = Path(args.train_dir).expanduser() if args.train_dir else base_dir / "train"
+    dir_valid = Path(args.valid_dir).expanduser() if args.valid_dir else base_dir / "valid"
+    dir_test  = Path(args.test_dir).expanduser()  if args.test_dir  else base_dir / "test"
+
+    stems_train = load_split_file(Path(args.train_split)) if args.train_split else None
+    stems_valid = load_split_file(Path(args.valid_split)) if args.valid_split else None
+    stems_test  = load_split_file(Path(args.test_split))  if args.test_split  else None
+
+    # DDP init
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
     use_ddp = (local_rank >= 0)
     if use_ddp:
-        backend = os.environ.get("DIST_BACKEND", "nccl")  # Windows 可设 gloo
+        backend = os.environ.get("DIST_BACKEND", "nccl")
         dist.init_process_group(backend=backend, timeout=datetime.timedelta(seconds=1800))
         torch.cuda.set_device(local_rank)
         device = torch.device("cuda", local_rank)
@@ -328,40 +336,47 @@ def main():
 
     if get_rank() == 0:
         print(f"[rank {get_rank()}] device={device} world_size={get_world_size()}")
-        print(f"BASE_DIR = {BASE_DIR}")
+        print(f"BASE_DIR = {base_dir}")
 
-    # 目录创建
-    # 目录创建 + 日志初始化
+    # paths for ckpts & logs (under base_dir/train_ddp)
+    dir_ckpt = base_dir / "train_ddp" / "checkpoints"
+    dir_logs = base_dir / "train_ddp" / "logs"
+    log_csv  = dir_logs / "training_log.csv"
+
     if get_rank() == 0:
-        DIR_CKPT.mkdir(parents=True, exist_ok=True)
-        DIR_LOGS.mkdir(parents=True, exist_ok=True)
-        # 若 CSV 不存在则写表头
-        if not LOG_CSV.exists():
-            with open(LOG_CSV, "w", newline="") as f:
+        dir_ckpt.mkdir(parents=True, exist_ok=True)
+        dir_logs.mkdir(parents=True, exist_ok=True)
+        if not log_csv.exists():
+            with open(log_csv, "w", newline="") as f:
                 w = csv.writer(f)
                 w.writerow(["epoch", "train_loss", "val_dice", "val_mIoU", "lr", "time_sec"])
 
-
-    # === 数据集 & 采样器 ===
-    extra_needed = (DIR_GLCM.exists() and EXTRA_MODE is not None)
-    use_cache = DIR_CACHE.exists() and (DIR_CACHE / "image").exists() and (DIR_CACHE / "index").exists()
+    # datasets & loaders
+    extra_dir = base_dir / "glcm" if EXTRA_MODE else None
+    cache_dir = base_dir / "cache"
+    extra_needed = (extra_dir is not None and extra_dir.exists())
+    use_cache = cache_dir.exists() and (cache_dir / "image").exists() and (cache_dir / "index").exists()
     if extra_needed:
-        use_cache = use_cache and (DIR_CACHE / "glcm").exists()
+        use_cache = use_cache and (cache_dir / "glcm").exists()
 
     train_set = SegFolderDataset(
-        split_dir=DIR_TRAIN,
-        extra_dir=DIR_GLCM if EXTRA_MODE else None,
+        split_dir=dir_train,
+        extra_dir=extra_dir,
         extra_mode=EXTRA_MODE,
         img_size=IMG_SIZE,
-        cache_dir=DIR_CACHE if use_cache else None
+        cache_dir=cache_dir if use_cache else None,
+        stems_allow=stems_train
     )
     val_set = SegFolderDataset(
-        split_dir=DIR_VALID,
-        extra_dir=DIR_GLCM if EXTRA_MODE else None,
+        split_dir=dir_valid,
+        extra_dir=extra_dir,
         extra_mode=EXTRA_MODE,
         img_size=IMG_SIZE,
-        cache_dir=DIR_CACHE if use_cache else None
+        cache_dir=cache_dir if use_cache else None,
+        stems_allow=stems_valid
     )
+    # (optional) test_set if you need later:
+    # test_set = SegFolderDataset(split_dir=dir_test, ... stems_allow=stems_test)
 
     if use_ddp:
         train_sampler = DistributedSampler(train_set, shuffle=True, drop_last=True)
@@ -391,7 +406,7 @@ def main():
         persistent_workers=PERSISTENT
     )
 
-    # === 模型 ===
+    # model
     sample = next(iter(DataLoader(train_set, batch_size=1, shuffle=False, num_workers=0)))
     in_ch = sample["image"].shape[1]
     model = UNet(n_channels=in_ch, n_classes=CLASSES, bilinear=BILINEAR).to(
@@ -399,15 +414,10 @@ def main():
     )
 
     if CLASSES != 1:
-        raise ValueError("此脚本为二分类（CLASSES=1）。多分类请改 CrossEntropy 分支。")
+        raise ValueError("This script is for binary segmentation (CLASSES=1).")
 
     if use_ddp:
-        model = DDP(
-            model,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            find_unused_parameters=False
-        )
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
 
     criterion = nn.BCEWithLogitsLoss()
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
@@ -417,7 +427,7 @@ def main():
     best_dice = -1.0
     step_in_epoch = 0
 
-    # === 训练循环 ===
+    # training loop
     for epoch in range(1, EPOCHS + 1):
         if use_ddp:
             train_sampler.set_epoch(epoch)
@@ -426,8 +436,8 @@ def main():
         epoch_loss = 0.0
         optimizer.zero_grad(set_to_none=True)
 
-        iter_obj = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}", unit="batch") if get_rank()==0 else train_loader
-        for batch in iter_obj:
+        it = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}", unit="batch") if get_rank()==0 else train_loader
+        for batch in it:
             images = batch["image"].to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
             masks  = batch["mask"].to(device=device, dtype=torch.long)
             masks_bin = (masks > 0).float()
@@ -466,10 +476,10 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
 
             epoch_loss += float(loss.item()) * ACCUM_STEPS
-            if get_rank()==0 and isinstance(iter_obj, tqdm):
-                iter_obj.set_postfix(loss=f"{(loss.item()*ACCUM_STEPS):.4f}")
+            if get_rank()==0 and isinstance(it, tqdm):
+                it.set_postfix(loss=f"{(loss.item()*ACCUM_STEPS):.4f}")
 
-        # 收尾：不足 ACCUM_STEPS 的残梯度再 step 一次
+        # tail step if remaining grads exist
         if step_in_epoch % ACCUM_STEPS != 0:
             if AMP_ENABLED:
                 scaler.unscale_(optimizer)
@@ -482,11 +492,12 @@ def main():
             optimizer.zero_grad(set_to_none=True)
         step_in_epoch = 0
 
-        # 验证 & 跨卡聚合
+        # validate
         val_dice, val_miou = quick_validate(model, val_loader, device, amp=AMP_ENABLED)
         val_dice_t = reduce_mean(torch.tensor(val_dice, device=device))
         val_miou_t = reduce_mean(torch.tensor(val_miou, device=device))
-        val_dice = val_dice_t.item(); val_miou = val_miou_t.item()
+        val_dice = val_dice_t.item()
+        val_miou = val_miou_t.item()
 
         scheduler.step(val_dice)
 
@@ -495,10 +506,9 @@ def main():
                   f"train_loss={epoch_loss/len(train_loader):.4f} | "
                   f"val_dice={val_dice:.4f} | val_mIoU={val_miou:.4f} | "
                   f"lr={optimizer.param_groups[0]['lr']:.2e}")
-            
-                # === 写入训练日志（rank0） ===
-        if get_rank()==0:
-            with open(LOG_CSV, "a", newline="") as f:
+
+            # append CSV log
+            with open(log_csv, "a", newline="") as f:
                 w = csv.writer(f)
                 w.writerow([
                     epoch,
@@ -509,33 +519,27 @@ def main():
                     round(time.time(), 3)
                 ])
 
-        # === 每 2 个 epoch 保存 checkpoint（rank0） ===
+        # save every 2 epochs
         if get_rank()==0 and (epoch % 2 == 0):
-            ckpt_path = DIR_CKPT / f"checkpoint_epoch{epoch}.pth"
+            ckpt_path = dir_ckpt / f"checkpoint_epoch{epoch}.pth"
             torch.save(
                 (model.module.state_dict() if isinstance(model, DDP) else model.state_dict()),
                 ckpt_path
             )
 
-
-        # 保存
-        if SAVE_EVERY_EPOCH and get_rank()==0:
-            DIR_CKPT.mkdir(parents=True, exist_ok=True)
-            torch.save(
-                (model.module.state_dict() if isinstance(model, DDP) else model.state_dict()),
-                DIR_CKPT / f"checkpoint_epoch{epoch}.pth"
-            )
-
+        # best model
         if get_rank()==0 and val_dice > best_dice:
             best_dice = val_dice
-            DIR_CKPT.mkdir(parents=True, exist_ok=True)
-            torch.save(
-                (model.module.state_dict() if isinstance(model, DDP) else model.state_dict()),
-                DIR_CKPT / "best.pth"
-            )
-            print(f"  ✅ New best! Saved to {DIR_CKPT / 'best.pth'} (val_dice={best_dice:.4f})")
+            state = (model.module.state_dict() if isinstance(model, DDP) else model.state_dict())
+            torch.save(state, dir_ckpt / "best.pth")
+            torch.save(state, dir_ckpt / "best_model.pth")
+            print(f"  ✅ New best! Saved to {dir_ckpt/'best.pth'} (val_dice={best_dice:.4f})")
 
-    # 退出进程组
+    # save last epoch
+    if get_rank()==0:
+        state = (model.module.state_dict() if isinstance(model, DDP) else model.state_dict())
+        torch.save(state, dir_ckpt / "last.pth")
+
     if use_ddp:
         dist.barrier()
         dist.destroy_process_group()
