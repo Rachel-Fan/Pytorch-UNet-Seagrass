@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 import numpy as np
 from PIL import Image
+import cv2
 
 import torch
 import torch.nn as nn
@@ -37,8 +38,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 
 # ================== CONFIG (edit defaults here or via CLI env) ==================
-# Point to local SSD copy for speed (e.g., /content/BB after rsync)
-BASE_DIR   = Path(os.environ.get("BASE_DIR", "/content/BB"))
+DEFAULT_BASE_DIR = Path(os.environ.get("BASE_DIR", "/content/drive/MyDrive/Drone AI/DroneVision_Model_data/OR"))
+
 
 # I/O
 IMG_SIZE        = 512
@@ -54,10 +55,11 @@ LR            = float(os.environ.get("LR", 3e-4))
 WEIGHT_DECAY  = float(os.environ.get("WEIGHT_DECAY", 1e-4))
 GRAD_CLIP     = float(os.environ.get("GRAD_CLIP", 1.0))
 
-NUM_WORKERS     = int(os.environ.get("NUM_WORKERS", 8))
-PREFETCH_FACTOR = int(os.environ.get("PREFETCH_FACTOR", 4))
-PIN_MEMORY      = True
-PERSISTENT      = True
+NUM_WORKERS     = int(os.environ.get("NUM_WORKERS", "2"))
+PREFETCH_FACTOR = int(os.environ.get("PREFETCH_FACTOR", "1"))
+PERSISTENT      = os.environ.get("PERSISTENT", "False").lower() == "true"
+PIN_MEMORY      = True  # ok
+
 
 AMP_ENABLED  = True
 CUDNN_BENCH  = True
@@ -167,15 +169,41 @@ class SegFolderDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         ip, mp, stem = self.pairs[idx]
-        img = Image.open(ip).convert("RGB")
-        msk = Image.open(mp)
 
-        img_p = pad_to_square(resize_longest_side(img, IMG_SIZE, is_mask=False), IMG_SIZE, fill=0)
-        msk_p = pad_to_square(resize_longest_side(msk, IMG_SIZE, is_mask=True),  IMG_SIZE, fill=0)
+        # ---- read with OpenCV (faster) ----
+        img_bgr = cv2.imread(str(ip), cv2.IMREAD_COLOR)         # HxWx3, BGR, uint8
+        if img_bgr is None:
+            raise RuntimeError(f"Failed to read image: {ip}")
+        img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)          # to RGB
 
-        x = torch.from_numpy(pil_to_chw_float(img_p).copy()).float()
-        y = torch.from_numpy(np.asarray(msk_p.convert("L")).copy()).long()
-        y = (y > 0).long()  # force binary
+        mask_raw = cv2.imread(str(mp), cv2.IMREAD_UNCHANGED)    # keep single channel if exists
+        if mask_raw is None:
+            raise RuntimeError(f"Failed to read mask: {mp}")
+        if mask_raw.ndim == 3:
+            # if mask is RGB, take one channel (any) then binarize later
+            mask_raw = cv2.cvtColor(mask_raw, cv2.COLOR_BGR2GRAY)
+
+        # ---- resize longest side to IMG_SIZE, then pad to square (right/bottom) ----
+        h, w = img.shape[:2]
+        scale = IMG_SIZE / max(h, w)
+        if max(h, w) != IMG_SIZE:
+            new_w, new_h = int(round(w * scale)), int(round(h * scale))
+            img_rs  = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            msk_rs  = cv2.resize(mask_raw, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+        else:
+            img_rs = img
+            msk_rs = mask_raw
+
+        # pad to square
+        pad_img = np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=img_rs.dtype)
+        pad_msk = np.zeros((IMG_SIZE, IMG_SIZE), dtype=msk_rs.dtype)
+        pad_img[:img_rs.shape[0], :img_rs.shape[1], :] = img_rs
+        pad_msk[:msk_rs.shape[0], :msk_rs.shape[1]] = msk_rs
+
+        # to tensors
+        x = torch.from_numpy(pad_img.transpose(2,0,1)).float() / 255.0
+        y = torch.from_numpy(pad_msk).long()
+        y = (y > 0).long()  # binarize
 
         return {"image": x, "mask": y, "stem": stem}
 
