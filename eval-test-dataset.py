@@ -80,7 +80,8 @@ class TestDataset(Dataset):
         msk = pil_resize_pad(Image.open(mp).convert("L"),   self.img_size, is_mask=True)
         x = to_tensor_rgb(img)
         y = torch.from_numpy((np.asarray(msk) > 0).astype(np.int64))
-        return {"image": x, "mask": y, "stem": ip.stem, "size": y.shape}
+        return {"image": x, "mask": y, "stem": ip.stem}
+
 
 # ---------- metric ----------
 def compute_metrics(pred, gt):
@@ -113,14 +114,12 @@ def evaluate(model, loader, device, csv_path: Path):
         logits=model(imgs)
         probs=torch.sigmoid(logits).squeeze(1).cpu().numpy()
         preds=(probs>0.5).astype(np.uint8)
-        for stem,pred,gt,sz in zip(batch["stem"],preds,gts,batch["size"]):
-            H,W=sz
-            iou,dice,prec,rec,tp,fp,fn,tn,inter,union=compute_metrics(pred,gt)
-            writer.writerow([stem,H,W,int(pred.sum()),int(gt.sum()),
-                             inter,union,iou,dice,prec,rec,tp,fp,fn,tn])
-            ious.append(iou);dices.append(dice);precs.append(prec);recs.append(rec)
-            if gt.sum()>0:
-                ious_ne.append(iou);dices_ne.append(dice)
+        for stem, pred, gt in zip(batch["stem"], preds, gts):
+            H, W = pred.shape  # safer than passing size through the DataLoader
+            iou, dice, prec, rec, tp, fp, fn, tn, inter, union = compute_metrics(pred, gt)
+            writer.writerow([stem, H, W, int(pred.sum()), int(gt.sum()),
+                            inter, union, iou, dice, prec, rec, tp, fp, fn, tn])
+
     fcsv.close()
 
     return {
