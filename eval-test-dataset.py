@@ -26,6 +26,16 @@ from unet.unet_model import UNet
 VALID_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
 # ---------- util ----------
+
+# --- 放到文件顶部 ---
+
+def safe_mean(x):
+    x = np.asarray(x, dtype=float)
+    x = x[~np.isnan(x)]
+    return float(x.mean()) if x.size else 0.0
+
+EPS = 1e-6
+
 def pil_resize_pad(im: Image.Image, size: int, is_mask: bool):
     w, h = im.size
     if max(w, h) != size:
@@ -98,38 +108,99 @@ def compute_metrics(pred, gt):
     return iou, dice, prec, rec, tp, fp, fn, tn, inter, union
 
 # ---------- eval ----------
+import json, time, math
+import numpy as np
+
+def _safe_div(a, b):
+    return float(a) / float(b) if b and b != 0 else 0.0
+
+def _nanmean(xs):
+    if not xs:
+        return 0.0
+    arr = np.array(xs, dtype=float)
+    # if all are NaN, nanmean would raise warning; handle that
+    if np.all(np.isnan(arr)):
+        return 0.0
+    return float(np.nanmean(arr))
+
 @torch.no_grad()
-def evaluate(model, loader, device, csv_path: Path):
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    fcsv = open(csv_path, "w", newline="", encoding="utf-8")
-    writer = csv.writer(fcsv)
-    writer.writerow(["filename","H","W","pixels_pred","pixels_gt","inter","union",
-                     "iou","dice","precision","recall","tp","fp","fn","tn"])
+def evaluate(model, dl, device, csv_path):
+    model.eval()
+    import csv
 
-    ious,dices,precs,recs=[],[],[],[]
-    ious_ne,dices_ne=[],[]
-    for batch in tqdm(loader, desc="Evaluating", unit="batch"):
-        imgs=batch["image"].to(device=device,dtype=torch.float32,memory_format=torch.channels_last)
-        gts=batch["mask"].cpu().numpy()
-        logits=model(imgs)
-        probs=torch.sigmoid(logits).squeeze(1).cpu().numpy()
-        preds=(probs>0.5).astype(np.uint8)
-        for stem, pred, gt in zip(batch["stem"], preds, gts):
-            H, W = pred.shape  # safer than passing size through the DataLoader
-            iou, dice, prec, rec, tp, fp, fn, tn, inter, union = compute_metrics(pred, gt)
-            writer.writerow([stem, H, W, int(pred.sum()), int(gt.sum()),
-                            inter, union, iou, dice, prec, rec, tp, fp, fn, tn])
+    all_iou, all_dice, all_prec, all_rec = [], [], [], []
+    nz_iou, nz_dice = [], []   # non-empty GT only
 
-    fcsv.close()
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["filename","H","W","pixels_pred","pixels_gt","inter","union",
+                    "iou","dice","precision","recall","tp","fp","fn","tn"])
 
-    return {
-        "mean_iou_overall":np.mean(ious).item(),
-        "mean_dice_overall":np.mean(dices).item(),
-        "mean_precision_overall":np.mean(precs).item(),
-        "mean_recall_overall":np.mean(recs).item(),
-        "mean_iou_non_empty_gt":np.mean(ious_ne).item() if ious_ne else float("nan"),
-        "mean_dice_non_empty_gt":np.mean(dices_ne).item() if dices_ne else float("nan"),
+        for batch in tqdm(dl, desc="Evaluating"):
+            imgs = batch["image"].to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
+            ys   = batch["mask"].to(device=device, dtype=torch.long)
+            stems= batch["stem"]
+
+            logits = model(imgs)
+            prob   = torch.sigmoid(logits.squeeze(1))  # (B,H,W)
+            pred   = (prob > 0.5).to(torch.long)
+
+            for i in range(pred.shape[0]):
+                p = pred[i]
+                y = ys[i]
+
+                H, W = p.shape[-2], p.shape[-1]
+                tp = int(((p==1) & (y==1)).sum().item())
+                fp = int(((p==1) & (y==0)).sum().item())
+                fn = int(((p==0) & (y==1)).sum().item())
+                tn = int(((p==0) & (y==0)).sum().item())
+
+                inter = tp
+                union = tp + fp + fn
+                pixels_pred = tp + fp
+                pixels_gt   = tp + fn
+
+                iou = _safe_div(inter, union)                       # Jaccard
+                dice = _safe_div(2*tp, 2*tp + fp + fn)              # F1/Dice
+                precision = _safe_div(tp, tp + fp)
+                recall    = _safe_div(tp, tp + fn)
+
+                all_iou.append(iou)
+                all_dice.append(dice)
+                all_prec.append(precision)
+                all_rec.append(recall)
+                if pixels_gt > 0:
+                    nz_iou.append(iou)
+                    nz_dice.append(dice)
+
+                w.writerow([
+                    stems[i], H, W, pixels_pred, pixels_gt, inter, union,
+                    iou, dice, precision, recall, tp, fp, fn, tn
+                ])
+
+    # robust means (no NaN)
+    metrics = {
+        "mean_iou_overall":      _nanmean(all_iou),
+        "mean_dice_overall":     _nanmean(all_dice),
+        "mean_precision_overall":_nanmean(all_prec),
+        "mean_recall_overall":   _nanmean(all_rec),
+        "mean_iou_non_empty_gt": _nanmean(nz_iou),
+        "mean_dice_non_empty_gt":_nanmean(nz_dice),
     }
+    return metrics
+
+def save_summary_json(out_dir, cmdline_str, metrics):
+    out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y-%m-%d_%H-%M-%S")
+    js = {
+        "timestamp": ts,
+        "command_line": cmdline_str,
+        "metrics": {k: float(v) for k, v in metrics.items()}  # ensure plain floats
+    }
+    with open(out_dir / "test-summary.json", "w", encoding="utf-8") as f:
+        json.dump(js, f, indent=2, ensure_ascii=False)
+    print("✅ summary saved to", out_dir / "test-summary.json")
+
 
 # ---------- main ----------
 def main():
