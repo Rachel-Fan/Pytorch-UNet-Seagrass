@@ -44,10 +44,10 @@ EXTRA_MODE      = None          # None | 'append4' | 'replace_red'
 CLASSES         = 1             # binary
 BILINEAR        = False
 
-EPOCHS        = 10
+EPOCHS        = 20
 BATCH_SIZE    = 4
 ACCUM_STEPS   = 4               # effective batch = BATCH_SIZE * ACCUM_STEPS * world_size
-LR            = 3e-5
+LR            = 3e-4
 WEIGHT_DECAY  = 1e-4
 GRAD_CLIP     = 1.0
 
