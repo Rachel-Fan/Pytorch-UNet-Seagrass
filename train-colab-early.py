@@ -195,46 +195,71 @@ class EarlyStopping:
 
 # -------------- train one epoch --------------
 from torch.amp import autocast, GradScaler
-def train_one_epoch(model, loader, optimizer, criterion, scaler, device, accum_steps, scheduler=None, max_norm=1.0):
+def train_one_epoch(model, loader, optimizer, criterion, scaler, device, accum_steps: int, scheduler=None):
     model.train()
-    running = 0.0
+    epoch_loss = 0.0
+    accum = 0  # how many micro-batches accumulated since last step
+
     optimizer.zero_grad(set_to_none=True)
+
+    use_amp = isinstance(scaler, torch.amp.grad_scaler.GradScaler) and scaler.is_enabled()
+
     it = tqdm(loader, desc="Train", leave=False)
     for step, (x, y) in enumerate(it):
         x = x.to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
         y = y.to(device=device, dtype=torch.long)
-        yb = (y > 0).float()
+        yf = (y > 0).float()
 
-        with autocast("cuda", enabled=True):
-            logits = model(x).squeeze(1)
-            loss_bce = criterion(logits, yb)
+        with torch.autocast(device_type=('cuda' if device.type == 'cuda' else 'cpu'), enabled=use_amp):
+            logits = model(x).squeeze(1)            # (B,H,W)
+            bce = criterion(logits, yf)
             prob = torch.sigmoid(logits)
-            inter = (prob * yb).sum(dim=(1,2))
-            denom = prob.sum(dim=(1,2)) + yb.sum(dim=(1,2)) + 1e-6
-            dice_loss = 1.0 - (2*inter/denom).mean()
-            loss = loss_bce + dice_loss
+            inter = (prob * yf).sum(dim=(1,2))
+            denom = prob.sum(dim=(1,2)) + yf.sum(dim=(1,2)) + 1e-6
+            dice = 1.0 - (2.0 * inter / denom).mean()  # dice loss
+            loss = (bce + dice)
 
-        if not torch.isfinite(loss):
-            it.set_postfix_str("skip non-finite loss"); optimizer.zero_grad(set_to_none=True); continue
+        # grad accumulation
+        loss_to_scale = loss / accum_steps
+        if use_amp:
+            scaler.scale(loss_to_scale).backward()
+        else:
+            loss_to_scale.backward()
 
-        loss = loss / max(1, accum_steps)
-        scaler.scale(loss).backward()
+        accum += 1
+        epoch_loss += float(loss.item())
 
-        if (step + 1) % max(1, accum_steps) == 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-            # guard NaN grads
-            skip = any([(p.grad is not None and torch.isnan(p.grad).any()) for p in model.parameters()])
-            if not skip:
+        # do an optimizer step only when we hit accum_steps
+        if accum == accum_steps:
+            if use_amp:
+                # Unscale once per optimizer step
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
-                if scheduler is not None and not isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
-                    scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
 
-        running += float(loss.item()) * max(1, accum_steps)
-        it.set_postfix(loss=f"{(loss.item()*max(1,accum_steps)):.4f}")
-    return running / max(1, len(loader))
+            optimizer.zero_grad(set_to_none=True)
+            accum = 0
+
+        it.set_postfix(loss=f"{loss.item():.4f}")
+
+    # tail flush (do this at most once, and only if we have leftover grads)
+    if accum > 0:
+        if use_amp:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+    # (optional) step a per-iteration scheduler here; for ReduceLROnPlateau keep it in eval()
+    return epoch_loss / max(1, len(loader))
 
 # ---------------- main ----------------
 def main():
