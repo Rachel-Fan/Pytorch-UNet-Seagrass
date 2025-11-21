@@ -1,6 +1,6 @@
 # 🌿 U-Net Seagrass — High-Resolution Drone Imagery Segmentation
 
-This repository provides a **U-Net–based segmentation pipeline** for eelgrass mapping using high-resolution drone imagery (Alaska / BC / WA / OR).  
+This repository provides a **U-Net–based segmentation pipeline** for eelgrass mapping using high-resolution drone imagery (Alaska / California / Washington / Oregon / British Columbia / ).  
 It supports **RGB**, **index channels**, and **custom multi-channel inputs** (e.g., RGB + Index + GLCM), and includes tiling, training, evaluation, and metric computation.
 
 ---
